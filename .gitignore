@@ -199,5 +199,4 @@ ecosystem.config.js
 
 # Others
 migrations/
-tests/
 package-lock.json
