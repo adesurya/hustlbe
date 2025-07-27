@@ -6,24 +6,27 @@ const slowDown = require('express-slow-down');
 // CORS configuration
 const corsOptions = {
   origin: function (origin, callback) {
-    const allowedOrigins = process.env.CORS_ORIGIN ? 
-      process.env.CORS_ORIGIN.split(',') : 
-      ['http://localhost:3000', 'http://localhost:3001'];
-    
+    // Allow requests from specific origins or no origin (for mobile apps)
+    const allowedOrigins = [
+      process.env.FRONTEND_URL,
+      'http://localhost:3000',
+      'http://localhost:3001',
+      'http://127.0.0.1:3000',
+      'http://127.0.0.1:3001'
+    ].filter(Boolean);
+
     // Allow requests with no origin (mobile apps, etc.)
     if (!origin) return callback(null, true);
     
-    if (allowedOrigins.includes(origin)) {
+    if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
     }
   },
-  credentials: process.env.CORS_CREDENTIALS === 'true',
+  credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  exposedHeaders: ['X-Total-Count', 'X-Rate-Limit-Remaining'],
-  maxAge: 86400 // 24 hours
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 };
 
 // Helmet configuration for security headers

@@ -59,8 +59,10 @@ const Category = sequelize.define('Category', {
 }, {
   tableName: 'categories',
   timestamps: true,
+  paranoid: true, // Enable soft delete
   createdAt: 'created_at',
   updatedAt: 'updated_at',
+  deletedAt: 'deleted_at', // Specify the deletedAt field
   hooks: {
     beforeValidate: (category) => {
       // Generate slug from name if not provided

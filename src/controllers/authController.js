@@ -88,7 +88,8 @@ class AuthController {
           'Login successful',
           {
             user: result.user,
-            accessToken: result.tokens.accessToken
+            accessToken: result.tokens.accessToken,
+            dailyLoginBonus: result.dailyLoginBonus || null
           },
           null,
           SUCCESS_CODES.LOGIN_SUCCESS
@@ -116,7 +117,14 @@ class AuthController {
 
       if (error.message.includes('deactivated')) {
         return res.status(HTTP_STATUS.UNAUTHORIZED.code).json(
-          errorResponse(error.message, ERROR_CODES.ACCOUNT_DISABLED)
+          errorResponse(
+            'Your account has been deactivated. For more information about your account status, please contact: support@sijago.ai', 
+            ERROR_CODES.ACCOUNT_DISABLED,
+            { 
+              supportContact: 'support@sijago.ai',
+              contactReason: 'Account deactivated - requires support assistance'
+            }
+          )
         );
       }
 
@@ -177,6 +185,9 @@ class AuthController {
    */
   logout = asyncHandler(async (req, res) => {
     try {
+      console.log('🚪 Logout request for user:', req.user.id);
+      
+      // authService.logout now handles token version increment internally
       await authService.logout(req.user);
 
       // Clear refresh token cookie
@@ -184,13 +195,14 @@ class AuthController {
 
       res.status(HTTP_STATUS.OK.code).json(
         successResponse(
-          'Logout successful',
+          'Logout successful. All tokens have been invalidated.',
           null,
           null,
           SUCCESS_CODES.LOGOUT_SUCCESS
         )
       );
     } catch (error) {
+      console.log('❌ Logout failed:', error.message);
       res.status(HTTP_STATUS.INTERNAL_SERVER_ERROR.code).json(
         errorResponse('Logout failed', ERROR_CODES.INTERNAL_ERROR)
       );
@@ -228,19 +240,53 @@ class AuthController {
   });
 
   /**
-   * Get current user profile
+   * Get current user profile (Enhanced)
    */
   getProfile = asyncHandler(async (req, res) => {
-    res.status(HTTP_STATUS.OK.code).json(
-      successResponse(
-        'Profile retrieved successfully',
-        { user: req.user.toSafeJSON() }
-      )
-    );
+    try {
+      // Get user with additional computed fields
+      const user = req.user;
+      
+      // Create enhanced profile data
+      const profileData = {
+        ...user.toSafeJSON(),
+        // Add computed fields
+        isLocked: user.isLocked(),
+        canEarnPoints: user.canEarnPoints(),
+        accountAge: Math.floor((new Date() - user.createdAt) / (1000 * 60 * 60 * 24)), // days
+        // Add verification status
+        verificationStatus: {
+          email: user.isVerified,
+          twoFactor: user.twoFactorEnabled
+        },
+        // Add account metrics
+        metrics: {
+          totalPoints: user.currentPoints,
+          lastLogin: user.lastLogin,
+          memberSince: user.createdAt
+        }
+      };
+
+      logSecurityEvent('profile_accessed', {
+        userId: user.id,
+        accessTime: new Date()
+      });
+
+      res.status(HTTP_STATUS.OK.code).json(
+        successResponse(
+          'Profile retrieved successfully',
+          { user: profileData }
+        )
+      );
+    } catch (error) {
+      res.status(HTTP_STATUS.INTERNAL_SERVER_ERROR.code).json(
+        errorResponse('Failed to retrieve profile', ERROR_CODES.INTERNAL_ERROR)
+      );
+    }
   });
 
   /**
-   * Update user profile
+   * Update user profile (Enhanced)
    */
   updateProfile = asyncHandler(async (req, res) => {
     const { username, email, phoneNumber, profilePicture } = req.body;
@@ -255,6 +301,7 @@ class AuthController {
     try {
       // Check for duplicate username/email if they're being updated
       if (updateData.username || updateData.email) {
+        const User = require('../models/User');
         const existingUser = await User.findOne({
           where: {
             [User.sequelize.Sequelize.Op.and]: [
@@ -277,12 +324,56 @@ class AuthController {
         }
       }
 
+      // If email is being updated, mark as unverified and send verification
+      if (updateData.email && updateData.email !== req.user.email) {
+        updateData.isVerified = false;
+        updateData.emailVerifiedAt = null;
+        
+        // Generate new verification token
+        const verificationToken = req.user.generateEmailVerificationToken();
+        updateData.emailVerificationToken = req.user.emailVerificationToken;
+        updateData.emailVerificationExpires = req.user.emailVerificationExpires;
+        updateData.emailVerificationSentAt = req.user.emailVerificationSentAt;
+        
+        // Send verification email to new address
+        try {
+          const emailService = require('../services/emailService');
+          const tempUser = { ...req.user.toJSON(), ...updateData };
+          await emailService.sendEmailVerification(tempUser, verificationToken);
+        } catch (emailError) {
+          logSecurityEvent('email_verification_send_failed', {
+            userId: req.user.id,
+            newEmail: updateData.email,
+            error: emailError.message
+          });
+        }
+      }
+
       await req.user.update(updateData);
+
+      // Create enhanced response data
+      const responseData = {
+        ...req.user.toSafeJSON(),
+        isLocked: req.user.isLocked(),
+        canEarnPoints: req.user.canEarnPoints(),
+        accountAge: Math.floor((new Date() - req.user.createdAt) / (1000 * 60 * 60 * 24))
+      };
+
+      logSecurityEvent('profile_updated', {
+        userId: req.user.id,
+        updatedFields: Object.keys(updateData),
+        emailChanged: !!updateData.email
+      });
 
       res.status(HTTP_STATUS.OK.code).json(
         successResponse(
-          'Profile updated successfully',
-          { user: req.user.toSafeJSON() },
+          updateData.email ? 
+            'Profile updated successfully. Please verify your new email address.' : 
+            'Profile updated successfully',
+          { 
+            user: responseData,
+            emailVerificationRequired: !!updateData.email
+          },
           null,
           SUCCESS_CODES.PROFILE_UPDATED
         )
@@ -351,7 +442,8 @@ class AuthController {
           result.message,
           {
             user: result.user,
-            alreadyVerified: result.alreadyVerified || false
+            alreadyVerified: result.alreadyVerified || false,
+            pointsAwarded: result.pointsAwarded || null
           },
           null,
           SUCCESS_CODES.EMAIL_VERIFIED
@@ -408,6 +500,156 @@ class AuthController {
 
       res.status(HTTP_STATUS.BAD_REQUEST.code).json(
         errorResponse(error.message, ERROR_CODES.VALIDATION_ERROR)
+      );
+    }
+  });
+
+  /**
+   * Get user profile by ID (Own profile or Admin access)
+   */
+  getUserProfileById = asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const requestingUserId = req.user.id;
+    const isAdmin = req.user.role === 'admin';
+
+    // Check if user is accessing their own profile or is admin
+    if (!isAdmin && parseInt(id) !== requestingUserId) {
+      logSecurityEvent('unauthorized_profile_access_attempt', {
+        requestingUserId,
+        targetUserId: id,
+        ipAddress: req.ip
+      });
+      
+      return res.status(HTTP_STATUS.FORBIDDEN.code).json(
+        errorResponse('Access denied. You can only view your own profile.', ERROR_CODES.ACCESS_DENIED)
+      );
+    }
+
+    try {
+      const User = require('../models/User');
+      const user = await User.findByPk(id, {
+        attributes: { exclude: ['passwordHash', 'refreshTokenHash', 'twoFactorSecret', 'emailVerificationToken'] },
+        paranoid: false // Include soft deleted users for admin
+      });
+
+      if (!user) {
+        return res.status(HTTP_STATUS.NOT_FOUND.code).json(
+          errorResponse('User not found', ERROR_CODES.RESOURCE_NOT_FOUND)
+        );
+      }
+
+      // For regular users viewing their own profile, ensure account is active
+      if (!isAdmin && !user.isActive) {
+        return res.status(HTTP_STATUS.FORBIDDEN.code).json(
+          errorResponse('Account is deactivated', ERROR_CODES.ACCOUNT_DISABLED)
+        );
+      }
+
+      // Create profile data based on access level
+      let profileData = user.toJSON();
+      
+      // For non-admin users viewing their own profile, hide admin-only fields
+      if (!isAdmin) {
+        delete profileData.loginAttempts;
+        delete profileData.lockedUntil;
+        delete profileData.tokenVersion;
+        delete profileData.deletedAt;
+        delete profileData.emailVerificationToken;
+        delete profileData.emailVerificationExpires;
+        delete profileData.emailVerificationSentAt;
+      }
+
+      // Add computed fields
+      profileData.isLocked = user.isLocked();
+      profileData.canEarnPoints = user.canEarnPoints();
+      profileData.accountAge = Math.floor((new Date() - user.createdAt) / (1000 * 60 * 60 * 24));
+
+      // Add verification status
+      profileData.verificationStatus = {
+        email: user.isVerified,
+        twoFactor: user.twoFactorEnabled
+      };
+
+      // Add account metrics
+      profileData.metrics = {
+        totalPoints: user.currentPoints,
+        lastLogin: user.lastLogin,
+        memberSince: user.createdAt
+      };
+
+      logSecurityEvent('profile_accessed_by_id', {
+        targetUserId: id,
+        accessedBy: requestingUserId,
+        isAdminAccess: isAdmin,
+        isOwnProfile: parseInt(id) === requestingUserId
+      });
+
+      res.status(HTTP_STATUS.OK.code).json(
+        successResponse(
+          isAdmin && parseInt(id) !== requestingUserId ? 
+            'User profile retrieved successfully (Admin access)' : 
+            'Your profile retrieved successfully',
+          { user: profileData }
+        )
+      );
+    } catch (error) {
+      res.status(HTTP_STATUS.INTERNAL_SERVER_ERROR.code).json(
+        errorResponse('Failed to retrieve profile', ERROR_CODES.INTERNAL_ERROR)
+      );
+    }
+  });
+
+  /**
+   * Get public user profile by ID (Limited public information)
+   */
+  getPublicProfile = asyncHandler(async (req, res) => {
+    const { id } = req.params;
+
+    try {
+      const User = require('../models/User');
+      const user = await User.findByPk(id, {
+        attributes: [
+          'id', 
+          'username', 
+          'profilePicture', 
+          'createdAt',
+          'isActive',
+          'isVerified'
+        ]
+      });
+
+      if (!user || !user.isActive || !user.isVerified) {
+        return res.status(HTTP_STATUS.NOT_FOUND.code).json(
+          errorResponse('User not found or profile not public', ERROR_CODES.RESOURCE_NOT_FOUND)
+        );
+      }
+
+      // Create limited public profile data (no sensitive information)
+      const publicProfile = {
+        id: user.id,
+        username: user.username,
+        profilePicture: user.profilePicture,
+        memberSince: user.createdAt,
+        isVerified: user.isVerified,
+        accountAge: Math.floor((new Date() - user.createdAt) / (1000 * 60 * 60 * 24)) // days
+      };
+
+      // Log public profile access (optional, for analytics)
+      logSecurityEvent('public_profile_accessed', {
+        targetUserId: id,
+        accessorIp: req.ip,
+        userAgent: req.get('User-Agent')
+      });
+
+      res.status(HTTP_STATUS.OK.code).json(
+        successResponse(
+          'Public profile retrieved successfully',
+          { user: publicProfile }
+        )
+      );
+    } catch (error) {
+      res.status(HTTP_STATUS.INTERNAL_SERVER_ERROR.code).json(
+        errorResponse('Failed to retrieve public profile', ERROR_CODES.INTERNAL_ERROR)
       );
     }
   });

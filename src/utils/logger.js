@@ -21,6 +21,25 @@ const logFormat = winston.format.combine(
   })
 );
 
+// Console format for better readability in development
+const consoleFormat = winston.format.combine(
+  winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+  winston.format.colorize(),
+  winston.format.printf(({ timestamp, level, message, stack, ...meta }) => {
+    let log = `${timestamp} [${level}]: ${message}`;
+    
+    if (stack) {
+      log += `\n${stack}`;
+    }
+    
+    if (Object.keys(meta).length > 0 && process.env.NODE_ENV === 'development') {
+      log += `\nMeta: ${JSON.stringify(meta, null, 2)}`;
+    }
+    
+    return log;
+  })
+);
+
 // Create logs directory if it doesn't exist
 const fs = require('fs');
 const logsDir = path.join(process.cwd(), 'logs');
@@ -37,6 +56,12 @@ const logger = winston.createLogger({
     environment: process.env.NODE_ENV || 'development'
   },
   transports: [
+    // ALWAYS include console transport to fix "no transports" warning
+    new winston.transports.Console({
+      format: consoleFormat,
+      level: process.env.NODE_ENV === 'production' ? 'error' : 'debug'
+    }),
+    
     // Error log file
     new winston.transports.File({
       filename: path.join(logsDir, 'error.log'),
@@ -75,6 +100,9 @@ const logger = winston.createLogger({
   
   // Handle exceptions and rejections
   exceptionHandlers: [
+    new winston.transports.Console({
+      format: consoleFormat
+    }),
     new winston.transports.File({
       filename: path.join(logsDir, 'exceptions.log'),
       maxsize: 5242880, // 5MB
@@ -83,6 +111,9 @@ const logger = winston.createLogger({
   ],
   
   rejectionHandlers: [
+    new winston.transports.Console({
+      format: consoleFormat
+    }),
     new winston.transports.File({
       filename: path.join(logsDir, 'rejections.log'),
       maxsize: 5242880, // 5MB
@@ -91,20 +122,8 @@ const logger = winston.createLogger({
   ]
 });
 
-// Add console transport for development
-if (process.env.NODE_ENV !== 'production') {
-  logger.add(new winston.transports.Console({
-    format: winston.format.combine(
-      winston.format.colorize(),
-      winston.format.simple(),
-      winston.format.printf(({ timestamp, level, message, stack }) => {
-        let log = `${timestamp} [${level}]: ${message}`;
-        if (stack) log += `\n${stack}`;
-        return log;
-      })
-    )
-  }));
-}
+// Remove duplicate file transports for production (they're already added above)
+// This was causing duplicate logs in the original code
 
 // Security logging functions
 const logSecurityEvent = (event, details = {}) => {
@@ -158,14 +177,22 @@ const logAPIRequest = (req, res, responseTime) => {
   const userAgent = headers['user-agent'] || 'Unknown';
   const userId = req.user ? req.user.id : null;
   
-  logger.info('API Request', {
+  // Use different log levels based on status code
+  let level = 'info';
+  if (res.statusCode >= 500) {
+    level = 'error';
+  } else if (res.statusCode >= 400) {
+    level = 'warn';
+  }
+  
+  logger.log(level, 'API Request', {
     method,
     url,
     statusCode: res.statusCode,
     ip,
     userAgent,
     userId,
-    responseTime,
+    responseTime: `${responseTime}ms`,
     timestamp: new Date().toISOString()
   });
 };
@@ -173,10 +200,6 @@ const logAPIRequest = (req, res, responseTime) => {
 // Express middleware for request logging
 const requestLogger = (req, res, next) => {
   const start = Date.now();
-  
-  // Log request
-  const { method, url, ip, headers } = req;
-  const userAgent = headers['user-agent'] || 'Unknown';
   
   // Override res.end to capture response
   const originalEnd = res.end;
@@ -202,6 +225,16 @@ const errorLogger = (error, req, res, next) => {
   next(error);
 };
 
+// Graceful shutdown
+const shutdownLogger = () => {
+  logger.info('Logger shutting down...');
+  logger.end();
+};
+
+// Handle process termination
+process.on('SIGTERM', shutdownLogger);
+process.on('SIGINT', shutdownLogger);
+
 module.exports = {
   logger,
   logSecurityEvent,
@@ -211,5 +244,6 @@ module.exports = {
   logDatabaseOperation,
   logAPIRequest,
   requestLogger,
-  errorLogger
+  errorLogger,
+  shutdownLogger
 };

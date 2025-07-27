@@ -83,25 +83,30 @@ router.get('/slug/:slug', optionalAuth, productController.getProductBySlug);
 
 /**
  * @route   POST /api/v1/products
- * @desc    Create new product
+ * @desc    Create new product with optional image upload
  * @access  Admin
  */
 router.post('/',
   authenticateToken,
   authorizeRoles('admin'),
+  uploadSingleProduct, // Handle file upload first
+  handleUploadError,
   validateProductCreate,
   productController.createProduct
 );
 
+
 /**
  * @route   PUT /api/v1/products/:id
- * @desc    Update product
+ * @desc    Update product with optional image upload
  * @access  Admin
  */
 router.put('/:id',
   authenticateToken,
   authorizeRoles('admin'),
   validateIdParam,
+  uploadSingleProduct,      // ← Tambahkan middleware upload
+  handleUploadError,        // ← Tambahkan error handler
   validateProductUpdate,
   productController.updateProduct
 );
@@ -120,7 +125,7 @@ router.delete('/:id',
 
 /**
  * @route   POST /api/v1/products/:id/image
- * @desc    Upload product image
+ * @desc    Upload product image (separate endpoint for existing products)
  * @access  Admin
  */
 router.post('/:id/image',

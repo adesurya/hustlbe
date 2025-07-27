@@ -8,7 +8,7 @@ const {
   ERROR_CODES,
   createPaginationMeta
 } = require('../utils/response');
-const { getFileUrl } = require('../middleware/upload');
+const { getFileUrl, deleteFile } = require('../middleware/upload');
 
 class ProductController {
   /**
@@ -251,41 +251,57 @@ class ProductController {
   });
 
   /**
-   * Create new product (Admin only)
+   * Create new product with optional image upload
    */
   createProduct = asyncHandler(async (req, res) => {
     const productData = req.body;
     const userId = req.user.id;
+    
+    // Get uploaded file if exists
+    const imageFile = req.file;
 
-    const product = await productService.createProduct(productData, userId);
+    try {
+      const product = await productService.createProduct(productData, userId, imageFile?.filename);
 
-    const productWithImageUrl = {
-      ...product.toSafeJSON(),
-      imageUrl: product.image ? getFileUrl(product.image, 'products') : null
-    };
+      const productWithImageUrl = {
+        ...product.toSafeJSON(),
+        imageUrl: product.image ? getFileUrl(product.image, 'products') : null
+      };
 
-    res.status(HTTP_STATUS.CREATED.code).json(
-      successResponse(
-        'Product created successfully',
-        productWithImageUrl,
-        null,
-        SUCCESS_CODES.RESOURCE_CREATED
-      )
-    );
+      res.status(HTTP_STATUS.CREATED.code).json(
+        successResponse(
+          'Product created successfully',
+          productWithImageUrl,
+          null,
+          SUCCESS_CODES.RESOURCE_CREATED
+        )
+      );
+    } catch (error) {
+      // Delete uploaded file if database operation fails
+      if (imageFile) {
+        deleteFile(`uploads/products/${imageFile.filename}`);
+      }
+      throw error;
+    }
   });
 
   /**
-   * Update product (Admin only)
-   */
-  updateProduct = asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const updateData = req.body;
-    const userId = req.user.id;
+ * Update product (Admin only)
+ */
+updateProduct = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const updateData = req.body;
+  const userId = req.user.id;
+  
+  // Get uploaded file if exists
+  const imageFile = req.file;
 
+  try {
     const product = await productService.updateProduct(
       parseInt(id),
       updateData,
-      userId
+      userId,
+      imageFile?.filename  // ← Pass image filename to service
     );
 
     const productWithImageUrl = {
@@ -301,7 +317,14 @@ class ProductController {
         SUCCESS_CODES.RESOURCE_UPDATED
       )
     );
-  });
+  } catch (error) {
+    // Delete uploaded file if database operation fails
+    if (imageFile) {
+      deleteFile(`uploads/products/${imageFile.filename}`);
+    }
+    throw error;
+  }
+});
 
   /**
    * Delete product (Admin only)
@@ -323,7 +346,7 @@ class ProductController {
   });
 
   /**
-   * Upload product image (Admin only)
+   * Upload product image (Admin only) - for existing products
    */
   uploadProductImage = asyncHandler(async (req, res) => {
     const { id } = req.params;
@@ -357,10 +380,7 @@ class ProductController {
       );
     } catch (error) {
       // Delete uploaded file if database operation fails
-      const fs = require('fs');
-      if (fs.existsSync(`uploads/products/${req.file.filename}`)) {
-        fs.unlinkSync(`uploads/products/${req.file.filename}`);
-      }
+      deleteFile(`uploads/products/${req.file.filename}`);
       throw error;
     }
   });

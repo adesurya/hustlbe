@@ -1,260 +1,256 @@
+const User = require('../models/User');
+const PointActivity = require('../models/PointActivity');
+const PointTransaction = require('../models/PointTransaction');
 const { sequelize } = require('../config/database');
-const { 
-  User, 
-  PointTransaction, 
-  PointActivity, 
-  PointRedemption 
-} = require('../models');
-const { logUserAction, logSystemError } = require('../utils/logger');
+const { logSecurityEvent } = require('../utils/logger');
 
 class PointService {
   /**
    * Award points to user for specific activity
    * @param {number} userId - User ID
-   * @param {string} activityCode - Activity code
+   * @param {string} activityCode - Activity code (e.g., 'EMAIL_VERIFY', 'DAILY_LOGIN')
    * @param {object} options - Additional options
    * @returns {object} Transaction result
    */
   async awardPoints(userId, activityCode, options = {}) {
-    const {
-      referenceId = null,
-      referenceType = null,
-      customAmount = null,
-      description = null,
-      metadata = null
-    } = options;
-
     const transaction = await sequelize.transaction();
 
     try {
-      // Get user and activity
-      const [user, activity] = await Promise.all([
-        User.findByPk(userId),
-        PointActivity.findByCode(activityCode)
-      ]);
+      console.log(`🎯 Attempting to award points for activity: ${activityCode} to user: ${userId}`);
 
-      if (!user) {
-        throw new Error('User not found');
+      // Find the activity
+      const activity = await PointActivity.findByCode(activityCode);
+      
+      if (!activity) {
+        console.log(`❌ Activity not found: ${activityCode}`);
+        await transaction.rollback();
+        return {
+          success: false,
+          message: `Activity ${activityCode} not found`,
+          awarded: false
+        };
       }
 
-      if (!activity) {
-        throw new Error('Activity not found');
+      console.log(`📋 Activity found:`, {
+        code: activity.activityCode,
+        name: activity.activityName,
+        points: activity.pointsReward,
+        isActive: activity.isActive
+      });
+
+      // Check if activity is valid and active
+      if (!activity.isValidNow()) {
+        console.log(`❌ Activity is not currently active: ${activityCode}`);
+        await transaction.rollback();
+        return {
+          success: false,
+          message: `Activity ${activityCode} is not currently active`,
+          awarded: false
+        };
       }
 
       // Check if user can earn points for this activity
-      const eligibility = await activity.canUserEarn(userId);
-      if (!eligibility.canEarn) {
-        throw new Error(eligibility.reason);
+      const canEarnResult = await activity.canUserEarn(userId);
+      
+      if (!canEarnResult.canEarn) {
+        console.log(`❌ User cannot earn points:`, canEarnResult.reason);
+        await transaction.rollback();
+        return {
+          success: false,
+          message: canEarnResult.reason,
+          awarded: false
+        };
       }
 
-      const pointsToAward = customAmount || activity.pointsReward;
+      // Get user
+      const user = await User.findByPk(userId, { transaction });
+      
+      if (!user) {
+        console.log(`❌ User not found: ${userId}`);
+        await transaction.rollback();
+        return {
+          success: false,
+          message: 'User not found',
+          awarded: false
+        };
+      }
+
+      // Check if user can earn points (active and verified)
+      if (!user.canEarnPoints()) {
+        console.log(`❌ User cannot earn points - not active or verified`);
+        await transaction.rollback();
+        return {
+          success: false,
+          message: 'User account must be active and verified to earn points',
+          awarded: false
+        };
+      }
+
+      const pointsToAward = activity.pointsReward;
+      const balanceBefore = user.currentPoints;
+
+      console.log(`💰 Awarding ${pointsToAward} points to user ${userId}`);
+      console.log(`💰 Balance before: ${balanceBefore}`);
 
       // Create point transaction
       const pointTransaction = await PointTransaction.create({
-        userId,
+        userId: userId,
         transactionType: 'credit',
         amount: pointsToAward,
-        balanceBefore: user.currentPoints,
+        balanceBefore: balanceBefore,
         activityType: activityCode,
-        activityDescription: description || `Points earned for ${activity.activityName}`,
-        referenceId,
-        referenceType,
+        activityDescription: activity.activityName,
+        referenceId: options.referenceId || null,
+        referenceType: options.referenceType || 'activity',
+        processedBy: options.processedBy || null,
         status: 'completed',
-        metadata
+        metadata: {
+          activityId: activity.id,
+          activityName: activity.activityName,
+          ...options.metadata
+        }
       }, { transaction });
 
       // Update user's current points
-      await user.update({
-        currentPoints: pointTransaction.balanceAfter
-      }, { transaction });
+      await user.addPoints(pointsToAward, transaction);
 
       await transaction.commit();
 
-      logUserAction('points_awarded', userId, {
-        activityCode,
+      console.log(`✅ Points awarded successfully!`);
+      console.log(`✅ Transaction ID: ${pointTransaction.id}`);
+      console.log(`✅ New balance: ${balanceBefore + pointsToAward}`);
+
+      // Log the point award
+      logSecurityEvent('points_awarded', {
+        userId: userId,
+        activityCode: activityCode,
         pointsAwarded: pointsToAward,
-        newBalance: pointTransaction.balanceAfter,
-        referenceId,
-        referenceType
+        balanceBefore: balanceBefore,
+        balanceAfter: balanceBefore + pointsToAward,
+        transactionId: pointTransaction.id
       });
 
       return {
-        transaction: pointTransaction,
-        newBalance: pointTransaction.balanceAfter,
-        pointsAwarded: pointsToAward
-      };
-    } catch (error) {
-      await transaction.rollback();
-      
-      logSystemError(error, {
-        context: 'award_points',
-        userId,
-        activityCode,
-        options
-      });
-      
-      throw error;
-    }
-  }
-
-  /**
-   * Deduct points from user
-   * @param {number} userId - User ID
-   * @param {number} amount - Points to deduct
-   * @param {string} activityType - Activity type
-   * @param {object} options - Additional options
-   * @returns {object} Transaction result
-   */
-  async deductPoints(userId, amount, activityType, options = {}) {
-    const {
-      referenceId = null,
-      referenceType = null,
-      description = null,
-      processedBy = null,
-      metadata = null
-    } = options;
-
-    const transaction = await sequelize.transaction();
-
-    try {
-      const user = await User.findByPk(userId);
-      
-      if (!user) {
-        throw new Error('User not found');
-      }
-
-      if (user.currentPoints < amount) {
-        throw new Error('Insufficient points balance');
-      }
-
-      // Create debit transaction
-      const pointTransaction = await PointTransaction.create({
-        userId,
-        transactionType: 'debit',
-        amount,
-        balanceBefore: user.currentPoints,
-        activityType,
-        activityDescription: description || `Points deducted for ${activityType}`,
-        referenceId,
-        referenceType,
-        processedBy,
-        status: 'completed',
-        metadata
-      }, { transaction });
-
-      // Update user's current points
-      await user.update({
-        currentPoints: pointTransaction.balanceAfter
-      }, { transaction });
-
-      await transaction.commit();
-
-      logUserAction('points_deducted', userId, {
-        activityType,
-        pointsDeducted: amount,
-        newBalance: pointTransaction.balanceAfter,
-        referenceId,
-        referenceType,
-        processedBy
-      });
-
-      return {
-        transaction: pointTransaction,
-        newBalance: pointTransaction.balanceAfter,
-        pointsDeducted: amount
-      };
-    } catch (error) {
-      await transaction.rollback();
-      
-      logSystemError(error, {
-        context: 'deduct_points',
-        userId,
-        amount,
-        activityType,
-        options
-      });
-      
-      throw error;
-    }
-  }
-
-  /**
-   * Get user's point balance and summary
-   * @param {number} userId - User ID
-   * @returns {object} Points summary
-   */
-  async getUserPointsSummary(userId) {
-    try {
-      const [user, transactionSummary, recentTransactions] = await Promise.all([
-        User.findByPk(userId, {
-          attributes: ['id', 'username', 'email', 'currentPoints']
-        }),
-        PointTransaction.getUserPointsSummary(userId),
-        PointTransaction.getUserTransactionHistory(userId, { limit: 5 })
-      ]);
-
-      if (!user) {
-        throw new Error('User not found');
-      }
-
-      return {
-        user: user.toSafeJSON(),
-        currentBalance: user.currentPoints,
-        summary: transactionSummary,
-        recentTransactions: recentTransactions.rows.map(t => t.toSafeJSON())
-      };
-    } catch (error) {
-      logSystemError(error, {
-        context: 'get_user_points_summary',
-        userId
-      });
-      throw error;
-    }
-  }
-
-  /**
-   * Get user's transaction history
-   * @param {number} userId - User ID
-   * @param {object} options - Query options
-   * @returns {object} Transaction history with pagination
-   */
-  async getUserTransactionHistory(userId, options = {}) {
-    try {
-      const result = await PointTransaction.getUserTransactionHistory(userId, options);
-      
-      return {
-        transactions: result.rows.map(t => t.toSafeJSON()),
-        pagination: {
-          currentPage: parseInt(options.page) || 1,
-          totalPages: Math.ceil(result.count / (parseInt(options.limit) || 20)),
-          totalItems: result.count,
-          itemsPerPage: parseInt(options.limit) || 20
+        success: true,
+        message: `Congratulations! You earned ${pointsToAward} points for ${activity.activityName}`,
+        awarded: true,
+        points: pointsToAward,
+        newBalance: balanceBefore + pointsToAward,
+        transaction: {
+          id: pointTransaction.id,
+          activity: activity.activityName,
+          amount: pointsToAward
         }
       };
+
     } catch (error) {
-      logSystemError(error, {
-        context: 'get_user_transaction_history',
-        userId,
-        options
+      await transaction.rollback();
+      console.error(`❌ Error awarding points:`, error);
+      
+      logSecurityEvent('points_award_error', {
+        userId: userId,
+        activityCode: activityCode,
+        error: error.message,
+        stack: error.stack
       });
-      throw error;
+
+      return {
+        success: false,
+        message: 'Failed to award points',
+        awarded: false,
+        error: error.message
+      };
     }
   }
 
   /**
-   * Request point redemption
+   * Award points for email verification
    * @param {number} userId - User ID
-   * @param {object} redemptionData - Redemption details
-   * @returns {object} Redemption request
+   * @returns {object} Result
    */
-  async requestRedemption(userId, redemptionData) {
-    const {
-      pointsToRedeem,
-      redemptionType,
-      redemptionValue = null,
-      redemptionDetails = {}
-    } = redemptionData;
+  async awardEmailVerificationPoints(userId) {
+    return this.awardPoints(userId, 'EMAIL_VERIFY', {
+      referenceType: 'email_verification',
+      metadata: {
+        event: 'email_verified',
+        timestamp: new Date().toISOString()
+      }
+    });
+  }
 
+  /**
+   * Award points for profile completion
+   * @param {number} userId - User ID
+   * @returns {object} Result
+   */
+  async awardProfileCompletionPoints(userId) {
+    return this.awardPoints(userId, 'PROFILE_COMPLETE', {
+      referenceType: 'profile_completion',
+      metadata: {
+        event: 'profile_completed',
+        timestamp: new Date().toISOString()
+      }
+    });
+  }
+
+  /**
+   * Award points for daily login
+   * @param {number} userId - User ID
+   * @returns {object} Result
+   */
+  async awardDailyLoginPoints(userId) {
+    return this.awardPoints(userId, 'DAILY_LOGIN', {
+      referenceType: 'daily_login',
+      metadata: {
+        event: 'daily_login',
+        timestamp: new Date().toISOString(),
+        loginDate: new Date().toISOString().split('T')[0]
+      }
+    });
+  }
+
+  /**
+   * Award points for sharing product
+   * @param {number} userId - User ID
+   * @param {number} productId - Product ID
+   * @returns {object} Result
+   */
+  async awardProductSharePoints(userId, productId) {
+    return this.awardPoints(userId, 'PRODUCT_SHARE', {
+      referenceId: productId.toString(),
+      referenceType: 'product_share',
+      metadata: {
+        event: 'product_shared',
+        productId: productId,
+        timestamp: new Date().toISOString()
+      }
+    });
+  }
+
+  /**
+   * Award points for sharing campaign
+   * @param {number} userId - User ID
+   * @param {number} campaignId - Campaign ID
+   * @returns {object} Result
+   */
+  async awardCampaignSharePoints(userId, campaignId) {
+    return this.awardPoints(userId, 'CAMPAIGN_SHARE', {
+      referenceId: campaignId.toString(),
+      referenceType: 'campaign_share',
+      metadata: {
+        event: 'campaign_shared',
+        campaignId: campaignId,
+        timestamp: new Date().toISOString()
+      }
+    });
+  }
+
+  /**
+   * Get user's point summary
+   * @param {number} userId - User ID
+   * @returns {object} Point summary
+   */
+  async getUserPointSummary(userId) {
     try {
       const user = await User.findByPk(userId);
       
@@ -262,198 +258,106 @@ class PointService {
         throw new Error('User not found');
       }
 
-      if (user.currentPoints < pointsToRedeem) {
-        throw new Error('Insufficient points for redemption');
-      }
-
-      // Create redemption request
-      const redemption = await PointRedemption.create({
-        userId,
-        pointsRedeemed: pointsToRedeem,
-        redemptionType,
-        redemptionValue,
-        redemptionDetails,
-        status: 'pending'
+      // Get transaction summary
+      const transactions = await PointTransaction.findAll({
+        where: { userId },
+        attributes: [
+          'transactionType',
+          [sequelize.fn('COUNT', sequelize.col('id')), 'count'],
+          [sequelize.fn('SUM', sequelize.col('amount')), 'total']
+        ],
+        group: ['transactionType']
       });
 
-      logUserAction('redemption_requested', userId, {
-        redemptionId: redemption.id,
-        pointsRequested: pointsToRedeem,
-        redemptionType,
-        redemptionValue
+      const summary = {
+        currentBalance: user.currentPoints,
+        totalEarned: 0,
+        totalSpent: 0,
+        transactionCounts: {
+          credit: 0,
+          debit: 0
+        }
+      };
+
+      transactions.forEach(tx => {
+        const count = parseInt(tx.dataValues.count);
+        const total = parseInt(tx.dataValues.total) || 0;
+        
+        if (tx.transactionType === 'credit') {
+          summary.totalEarned = total;
+          summary.transactionCounts.credit = count;
+        } else {
+          summary.totalSpent = total;
+          summary.transactionCounts.debit = count;
+        }
       });
 
-      return redemption;
+      return summary;
     } catch (error) {
-      logSystemError(error, {
-        context: 'request_redemption',
-        userId,
-        redemptionData
-      });
+      console.error('Error getting user point summary:', error);
       throw error;
     }
   }
 
   /**
-   * Get available point activities
-   * @returns {Array} Active point activities
+   * Check if user has completed specific activity today
+   * @param {number} userId - User ID
+   * @param {string} activityCode - Activity code
+   * @returns {boolean} Has completed today
    */
-  async getAvailableActivities() {
+  async hasCompletedActivityToday(userId, activityCode) {
+    try {
+      const today = new Date();
+      const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+      const endOfDay = new Date(startOfDay.getTime() + 24 * 60 * 60 * 1000);
+
+      const count = await PointTransaction.count({
+        where: {
+          userId,
+          activityType: activityCode,
+          status: 'completed',
+          created_at: {
+            [sequelize.Op.gte]: startOfDay,
+            [sequelize.Op.lt]: endOfDay
+          }
+        }
+      });
+
+      return count > 0;
+    } catch (error) {
+      console.error('Error checking daily activity completion:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Get available activities for user
+   * @param {number} userId - User ID
+   * @returns {array} Available activities
+   */
+  async getAvailableActivitiesForUser(userId) {
     try {
       const activities = await PointActivity.findActiveActivities();
-      return activities.map(activity => ({
-        id: activity.id,
-        code: activity.activityCode,
-        name: activity.activityName,
-        description: activity.description,
-        pointsReward: activity.pointsReward,
-        dailyLimit: activity.dailyLimit,
-        totalLimit: activity.totalLimit,
-        isActive: activity.isActive
-      }));
-    } catch (error) {
-      logSystemError(error, { context: 'get_available_activities' });
-      throw error;
-    }
-  }
+      const availableActivities = [];
 
-  /**
-   * Get system-wide point statistics (Admin only)
-   * @returns {object} System statistics
-   */
-  async getSystemStatistics() {
-    try {
-      const [basicStats, activityStats, redemptionStats] = await Promise.all([
-        PointTransaction.getSystemPointsStatistics(),
-        this.getActivityStatistics(),
-        this.getRedemptionStatistics()
-      ]);
-
-      return {
-        overview: basicStats,
-        activities: activityStats,
-        redemptions: redemptionStats
-      };
-    } catch (error) {
-      logSystemError(error, { context: 'get_system_statistics' });
-      throw error;
-    }
-  }
-
-  /**
-   * Get activity statistics
-   * @returns {Array} Activity statistics
-   */
-  async getActivityStatistics() {
-    try {
-      const stats = await sequelize.query(`
-        SELECT 
-          pt.activity_type,
-          COUNT(*) as transaction_count,
-          SUM(pt.amount) as total_points,
-          COUNT(DISTINCT pt.user_id) as unique_users,
-          AVG(pt.amount) as avg_points_per_transaction
-        FROM point_transactions pt
-        WHERE pt.transaction_type = 'credit' AND pt.status = 'completed'
-        GROUP BY pt.activity_type
-        ORDER BY total_points DESC
-      `, {
-        type: sequelize.QueryTypes.SELECT
-      });
-
-      return stats;
-    } catch (error) {
-      logSystemError(error, { context: 'get_activity_statistics' });
-      throw error;
-    }
-  }
-
-  /**
-   * Get redemption statistics
-   * @returns {object} Redemption statistics
-   */
-  async getRedemptionStatistics() {
-    try {
-      const [statusStats, typeStats] = await Promise.all([
-        sequelize.query(`
-          SELECT 
-            status,
-            COUNT(*) as count,
-            SUM(points_redeemed) as total_points
-          FROM point_redemptions
-          GROUP BY status
-        `, { type: sequelize.QueryTypes.SELECT }),
-        
-        sequelize.query(`
-          SELECT 
-            redemption_type,
-            COUNT(*) as count,
-            SUM(points_redeemed) as total_points,
-            AVG(points_redeemed) as avg_points
-          FROM point_redemptions
-          WHERE status IN ('approved', 'completed')
-          GROUP BY redemption_type
-          ORDER BY total_points DESC
-        `, { type: sequelize.QueryTypes.SELECT })
-      ]);
-
-      return {
-        byStatus: statusStats,
-        byType: typeStats
-      };
-    } catch (error) {
-      logSystemError(error, { context: 'get_redemption_statistics' });
-      throw error;
-    }
-  }
-
-  /**
-   * Process redemption (Admin only)
-   * @param {number} redemptionId - Redemption ID
-   * @param {string} action - 'approve' or 'reject'
-   * @param {number} adminId - Admin user ID
-   * @param {string} notes - Admin notes
-   * @returns {object} Updated redemption
-   */
-  async processRedemption(redemptionId, action, adminId, notes = null) {
-    try {
-      const redemption = await PointRedemption.findByPk(redemptionId, {
-        include: [{
-          model: User,
-          as: 'user',
-          attributes: ['id', 'username', 'email', 'currentPoints']
-        }]
-      });
-
-      if (!redemption) {
-        throw new Error('Redemption not found');
+      for (const activity of activities) {
+        const canEarn = await activity.canUserEarn(userId);
+        availableActivities.push({
+          id: activity.id,
+          code: activity.activityCode,
+          name: activity.activityName,
+          description: activity.description,
+          points: activity.pointsReward,
+          dailyLimit: activity.dailyLimit,
+          totalLimit: activity.totalLimit,
+          canEarn: canEarn.canEarn,
+          reason: canEarn.reason
+        });
       }
 
-      let result;
-      if (action === 'approve') {
-        result = await redemption.approve(adminId, notes);
-      } else if (action === 'reject') {
-        result = await redemption.reject(adminId, notes);
-      } else {
-        throw new Error('Invalid action. Must be "approve" or "reject"');
-      }
-
-      logUserAction('redemption_processed', adminId, {
-        redemptionId,
-        action,
-        userId: redemption.userId,
-        pointsInvolved: redemption.pointsRedeemed,
-        notes
-      });
-
-      return result;
+      return availableActivities;
     } catch (error) {
-      logSystemError(error, {
-        context: 'process_redemption',
-        redemptionId,
-        action,
-        adminId
-      });
+      console.error('Error getting available activities:', error);
       throw error;
     }
   }

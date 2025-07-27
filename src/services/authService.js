@@ -3,35 +3,76 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const User = require('../models/User');
 const emailService = require('./emailService');
+const pointService = require('./pointService'); // Add point service
 const { logAuthAttempt, logSecurityEvent } = require('../utils/logger');
 
 class AuthService {
   /**
-   * Generate JWT tokens
+   * Generate JWT tokens with token version
    * @param {object} user - User object
    * @returns {object} Access and refresh tokens
    */
   generateTokens(user) {
+    // Ensure tokenVersion is a number, default to 0 if null/undefined
+    const currentTokenVersion = user.tokenVersion !== null && user.tokenVersion !== undefined ? user.tokenVersion : 0;
+    
+    console.log('🔐 Generating tokens for user:', {
+      userId: user.id,
+      currentTokenVersion: currentTokenVersion,
+      userTokenVersion: user.tokenVersion,
+      userTokenVersionType: typeof user.tokenVersion
+    });
+
     const payload = {
       userId: user.id,
       email: user.email,
       role: user.role,
+      tokenVersion: currentTokenVersion, // Explicitly include token version
       iat: Math.floor(Date.now() / 1000)
     };
 
+    console.log('🔐 Token payload:', payload);
+
     const accessToken = jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: process.env.JWT_EXPIRE || '24h',
+      expiresIn: process.env.JWT_EXPIRE || '15m',
       algorithm: 'HS256'
     });
 
     const refreshToken = jwt.sign(
-      { userId: user.id },
+      { 
+        userId: user.id,
+        tokenVersion: currentTokenVersion // Also include in refresh token
+      },
       process.env.JWT_REFRESH_SECRET,
       {
         expiresIn: process.env.JWT_REFRESH_EXPIRE || '7d',
         algorithm: 'HS256'
       }
     );
+
+    // Debug: Verify the tokens contain tokenVersion
+    try {
+      const decodedAccess = jwt.decode(accessToken);
+      const decodedRefresh = jwt.decode(refreshToken);
+      
+      console.log('🔍 Generated token verification:', {
+        accessTokenVersion: decodedAccess.tokenVersion,
+        refreshTokenVersion: decodedRefresh.tokenVersion,
+        expectedVersion: currentTokenVersion,
+        accessTokenVersionType: typeof decodedAccess.tokenVersion,
+        refreshTokenVersionType: typeof decodedRefresh.tokenVersion
+      });
+      
+      // Additional check - verify token can be decoded properly
+      if (decodedAccess.tokenVersion === undefined) {
+        console.error('❌ CRITICAL: Access token tokenVersion is undefined!');
+        console.error('❌ User object:', JSON.stringify(user.toJSON(), null, 2));
+        console.error('❌ Payload:', JSON.stringify(payload, null, 2));
+      }
+      
+    } catch (error) {
+      console.error('❌ Token decode error:', error);
+    }
 
     return { accessToken, refreshToken };
   }
@@ -60,7 +101,7 @@ class AuthService {
         throw new Error(`User with this ${field} already exists`);
       }
 
-      // Create new user (unverified)
+      // Create new user (unverified) with explicit tokenVersion
       const user = await User.create({
         username: username.toLowerCase(),
         email: email.toLowerCase(),
@@ -68,8 +109,12 @@ class AuthService {
         passwordHash: password, // Will be hashed by the model hook
         role: 'user',
         isVerified: false,
-        isActive: true
+        isActive: true,
+        tokenVersion: 0 // Explicitly set initial token version
       });
+
+      // Reload user to ensure all fields are populated
+      await user.reload();
 
       // Generate email verification token
       const verificationToken = user.generateEmailVerificationToken();
@@ -84,16 +129,14 @@ class AuthService {
           email: user.email,
           error: emailError.message
         });
-        
-        // Don't fail registration if email sending fails
-        // User can resend verification later
       }
 
       logAuthAttempt('register', true, {
         userId: user.id,
         username: user.username,
         email: user.email,
-        requiresVerification: true
+        requiresVerification: true,
+        tokenVersion: user.tokenVersion
       });
 
       return {
@@ -111,7 +154,7 @@ class AuthService {
   }
 
   /**
-   * Login user
+   * Login user with daily login bonus
    * @param {string} identifier - Username or email
    * @param {string} password - User password
    * @param {string} ipAddress - Client IP address
@@ -119,8 +162,11 @@ class AuthService {
    */
   async login(identifier, password, ipAddress) {
     try {
+      console.log('🔍 Login attempt:', { identifier, ipAddress });
+      
       // Find user by email or username
-      const user = await User.findByEmailOrUsername(identifier);
+      let user = await User.findByEmailOrUsername(identifier);
+      console.log('👤 User found:', user ? `ID: ${user.id}, Email: ${user.email}, Username: ${user.username}, TokenVersion: ${user.tokenVersion}` : 'No user found');
 
       if (!user) {
         logSecurityEvent('login_attempt_invalid_user', {
@@ -130,8 +176,18 @@ class AuthService {
         throw new Error('Invalid credentials');
       }
 
+      // Ensure tokenVersion is not null - fix if needed
+      if (user.tokenVersion === null || user.tokenVersion === undefined) {
+        console.log('🔧 Fixing null tokenVersion for user:', user.id);
+        await user.update({ tokenVersion: 0 });
+        // Reload user to get fresh data
+        await user.reload();
+        console.log('🔧 Fixed tokenVersion:', user.tokenVersion);
+      }
+
       // Check if account is locked
       if (user.isLocked()) {
+        console.log('🔒 Account is locked until:', user.lockedUntil);
         logSecurityEvent('login_attempt_locked_account', {
           userId: user.id,
           ipAddress,
@@ -142,6 +198,7 @@ class AuthService {
 
       // Check if account is active
       if (!user.isActive) {
+        console.log('❌ Account is not active');
         logSecurityEvent('login_attempt_inactive_account', {
           userId: user.id,
           ipAddress
@@ -151,6 +208,7 @@ class AuthService {
 
       // Check if email is verified
       if (!user.isVerified) {
+        console.log('📧 Email is not verified');
         logSecurityEvent('login_attempt_unverified_email', {
           userId: user.id,
           ipAddress
@@ -159,7 +217,9 @@ class AuthService {
       }
 
       // Validate password
+      console.log('🔐 Validating password...');
       const isPasswordValid = await user.validatePassword(password);
+      console.log('🔐 Password validation result:', isPasswordValid);
 
       if (!isPasswordValid) {
         // Increment login attempts
@@ -177,22 +237,64 @@ class AuthService {
       // Reset login attempts on successful login
       await user.resetLoginAttempts();
 
-      // Generate tokens
+      // IMPORTANT: Reload user again to ensure we have the latest tokenVersion
+      await user.reload();
+      console.log('🔄 User reloaded before token generation. TokenVersion:', user.tokenVersion);
+
+      // Generate tokens with current token version
       const tokens = this.generateTokens(user);
 
       // Save refresh token hash
       await user.setRefreshToken(tokens.refreshToken);
 
+      // NEW: Award daily login points (if eligible)
+      let dailyLoginResult = null;
+      try {
+        console.log('🎯 Checking daily login bonus eligibility...');
+        const hasLoggedInToday = await pointService.hasCompletedActivityToday(user.id, 'DAILY_LOGIN');
+        
+        if (!hasLoggedInToday) {
+          console.log('🎁 User eligible for daily login bonus');
+          dailyLoginResult = await pointService.awardDailyLoginPoints(user.id);
+          console.log('🎁 Daily login result:', dailyLoginResult);
+        } else {
+          console.log('⏰ User already received daily login bonus today');
+        }
+      } catch (pointError) {
+        console.error('❌ Error awarding daily login points:', pointError);
+        // Don't throw error - login should still succeed even if points fail
+        logSecurityEvent('daily_login_points_error', {
+          userId: user.id,
+          error: pointError.message
+        });
+      }
+
       logAuthAttempt('login', true, {
         userId: user.id,
-        ipAddress
+        ipAddress,
+        tokenVersion: user.tokenVersion,
+        dailyLoginBonus: dailyLoginResult?.awarded || false
       });
 
-      return {
+      console.log('✅ Login successful for user:', user.id, 'with token version:', user.tokenVersion);
+
+      const response = {
         user: user.toSafeJSON(),
         tokens
       };
+
+      // Add daily login bonus info to response if awarded
+      if (dailyLoginResult?.awarded) {
+        response.dailyLoginBonus = {
+          awarded: true,
+          points: dailyLoginResult.points,
+          message: dailyLoginResult.message
+        };
+      }
+
+      return response;
     } catch (error) {
+      console.log('❌ Login failed:', error.message);
       logAuthAttempt('login', false, {
         identifier,
         ipAddress,
@@ -203,7 +305,7 @@ class AuthService {
   }
 
   /**
-   * Refresh access token
+   * Refresh access token with version validation
    * @param {string} refreshToken - Refresh token
    * @returns {object} New tokens
    */
@@ -219,6 +321,25 @@ class AuthService {
         throw new Error('Invalid refresh token');
       }
 
+      // Ensure tokenVersion is not null
+      if (user.tokenVersion === null || user.tokenVersion === undefined) {
+        await user.update({ tokenVersion: 0 });
+        await user.reload();
+      }
+
+      // Check token version - if different, refresh token is invalid
+      const userTokenVersion = user.tokenVersion || 0;
+      const decodedTokenVersion = decoded.tokenVersion || 0;
+      
+      if (decodedTokenVersion !== userTokenVersion) {
+        logSecurityEvent('invalid_refresh_token_version', {
+          userId: user.id,
+          decodedVersion: decodedTokenVersion,
+          currentVersion: userTokenVersion
+        });
+        throw new Error('Invalid refresh token - please log in again');
+      }
+
       // Validate refresh token
       if (!user.validateRefreshToken(refreshToken)) {
         logSecurityEvent('invalid_refresh_token_used', {
@@ -227,14 +348,15 @@ class AuthService {
         throw new Error('Invalid refresh token');
       }
 
-      // Generate new tokens
+      // Generate new tokens with current token version
       const tokens = this.generateTokens(user);
 
       // Save new refresh token hash
       await user.setRefreshToken(tokens.refreshToken);
 
       logAuthAttempt('token_refresh', true, {
-        userId: user.id
+        userId: user.id,
+        tokenVersion: user.tokenVersion
       });
 
       return {
@@ -250,18 +372,21 @@ class AuthService {
   }
 
   /**
-   * Logout user
+   * Logout user by invalidating all tokens
    * @param {object} user - User object
    * @returns {boolean} Success status
    */
   async logout(user) {
     try {
-      // Clear refresh token
-      await user.update({ refreshTokenHash: null });
+      // Invalidate all tokens by incrementing token version
+      await user.invalidateAllTokens('logout');
 
       logAuthAttempt('logout', true, {
-        userId: user.id
+        userId: user.id,
+        newTokenVersion: user.tokenVersion
       });
+
+      console.log('✅ Logout successful for user:', user.id, 'New token version:', user.tokenVersion);
 
       return true;
     } catch (error) {
@@ -274,7 +399,7 @@ class AuthService {
   }
 
   /**
-   * Change user password
+   * Change user password and invalidate all tokens
    * @param {object} user - User object
    * @param {string} currentPassword - Current password
    * @param {string} newPassword - New password
@@ -295,12 +420,17 @@ class AuthService {
       // Update password
       await user.update({
         passwordHash: newPassword, // Will be hashed by the model hook
-        refreshTokenHash: null // Invalidate all refresh tokens
       });
 
+      // Invalidate all tokens by incrementing token version
+      await user.invalidateAllTokens('password_change');
+
       logAuthAttempt('password_change', true, {
-        userId: user.id
+        userId: user.id,
+        newTokenVersion: user.tokenVersion
       });
+
+      console.log('✅ Password changed for user:', user.id, 'New token version:', user.tokenVersion);
 
       return true;
     } catch (error) {
@@ -334,18 +464,14 @@ class AuthService {
     const resetToken = crypto.randomBytes(32).toString('hex');
     const resetTokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
     
-    // Store reset token hash in user record (you may want to add this field to the User model)
-    // user.passwordResetToken = resetTokenHash;
-    // user.passwordResetExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-    
     return resetToken;
   }
 
   /**
-   * Verify email address
+   * Verify email address with point reward
    * @param {string} token - Verification token
    * @param {string} email - User email
-   * @returns {object} Success message
+   * @returns {object} Success message with point info
    */
   async verifyEmail(token, email) {
     try {
@@ -383,11 +509,25 @@ class AuthService {
       // Mark email as verified
       await user.markEmailAsVerified();
 
+      // NEW: Award points for email verification
+      let pointsResult = null;
+      try {
+        console.log('🎯 Awarding email verification points...');
+        pointsResult = await pointService.awardEmailVerificationPoints(user.id);
+        console.log('🎁 Email verification points result:', pointsResult);
+      } catch (pointError) {
+        console.error('❌ Error awarding email verification points:', pointError);
+        // Don't throw error - verification should still succeed even if points fail
+        logSecurityEvent('email_verification_points_error', {
+          userId: user.id,
+          error: pointError.message
+        });
+      }
+
       // Send welcome email
       try {
         await emailService.sendWelcomeEmail(user);
       } catch (emailError) {
-        // Don't fail verification if welcome email fails
         logSecurityEvent('welcome_email_send_failed', {
           userId: user.id,
           error: emailError.message
@@ -396,13 +536,25 @@ class AuthService {
 
       logAuthAttempt('email_verification', true, {
         userId: user.id,
-        email: user.email
+        email: user.email,
+        pointsAwarded: pointsResult?.awarded || false
       });
 
-      return {
+      const response = {
         message: 'Email verified successfully! You can now log in to your account.',
         user: user.toSafeJSON()
       };
+
+      // Add points info to response if awarded
+      if (pointsResult?.awarded) {
+        response.pointsAwarded = {
+          points: pointsResult.points,
+          message: pointsResult.message,
+          newBalance: pointsResult.newBalance
+        };
+      }
+
+      return response;
     } catch (error) {
       logAuthAttempt('email_verification', false, {
         email,
@@ -427,7 +579,6 @@ class AuthService {
       });
 
       if (!user) {
-        // Don't reveal if email exists for security
         return {
           message: 'If an account with this email exists and is not verified, a verification email has been sent.'
         };

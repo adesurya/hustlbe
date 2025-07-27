@@ -125,6 +125,18 @@ const Product = sequelize.define('Product', {
     type: DataTypes.INTEGER,
     allowNull: true,
     field: 'updated_by'
+  },
+  createdAt: {
+    type: DataTypes.DATE,
+    allowNull: false,
+    field: 'created_at',
+    defaultValue: DataTypes.NOW
+  },
+  updatedAt: {
+    type: DataTypes.DATE,
+    allowNull: false,
+    field: 'updated_at',
+    defaultValue: DataTypes.NOW
   }
 }, {
   tableName: 'products',
@@ -189,7 +201,7 @@ Product.findActiveProducts = function(options = {}) {
       attributes: ['id', 'name', 'slug'],
       where: { isActive: true }
     }],
-    order: [['sortOrder', 'ASC'], ['createdAt', 'DESC']],
+    order: [['sortOrder', 'ASC'], ['created_at', 'DESC']],
     ...options
   });
 };
@@ -257,7 +269,7 @@ Product.searchProducts = function(query, options = {}) {
       attributes: ['id', 'name', 'slug'],
       where: { isActive: true }
     }],
-    order: [['viewCount', 'DESC'], ['createdAt', 'DESC']],
+    order: [['viewCount', 'DESC'], ['created_at', 'DESC']],
     ...options
   });
 };

@@ -32,7 +32,6 @@ const PointTransaction = sequelize.define('PointTransaction', {
   balanceBefore: {
     type: DataTypes.INTEGER,
     allowNull: false,
-    defaultValue: 0,
     field: 'balance_before',
     validate: {
       min: 0,
@@ -40,13 +39,17 @@ const PointTransaction = sequelize.define('PointTransaction', {
     }
   },
   balanceAfter: {
-    type: DataTypes.INTEGER,
-    allowNull: false,
-    defaultValue: 0,
-    field: 'balance_after',
-    validate: {
-      min: 0,
-      isInt: true
+    type: DataTypes.VIRTUAL,
+    get() {
+      const balance = this.balanceBefore;
+      const amount = this.amount;
+      const type = this.transactionType;
+      
+      if (type === 'credit') {
+        return balance + amount;
+      } else {
+        return balance - amount;
+      }
     }
   },
   activityType: {
@@ -55,12 +58,12 @@ const PointTransaction = sequelize.define('PointTransaction', {
     field: 'activity_type'
   },
   activityDescription: {
-    type: DataTypes.TEXT,
+    type: DataTypes.STRING(255),
     allowNull: true,
     field: 'activity_description'
   },
   referenceId: {
-    type: DataTypes.STRING(100),
+    type: DataTypes.STRING(50),
     allowNull: true,
     field: 'reference_id'
   },
@@ -82,170 +85,245 @@ const PointTransaction = sequelize.define('PointTransaction', {
       key: 'id'
     }
   },
-  metadata: {
-    type: DataTypes.JSON,
-    allowNull: true
-  },
-  expiresAt: {
+  processedAt: {
     type: DataTypes.DATE,
     allowNull: true,
-    field: 'expires_at'
+    field: 'processed_at',
+    defaultValue: DataTypes.NOW
+  },
+  metadata: {
+    type: DataTypes.JSON,
+    allowNull: true,
+    comment: 'Additional data related to the transaction'
+  },
+  notes: {
+    type: DataTypes.TEXT,
+    allowNull: true,
+    comment: 'Administrative notes about the transaction'
   }
 }, {
   tableName: 'point_transactions',
   timestamps: true,
   createdAt: 'created_at',
   updatedAt: 'updated_at',
-  hooks: {
-    beforeCreate: (transaction) => {
-      // Calculate balance after based on transaction type
-      if (transaction.transactionType === 'credit') {
-        transaction.balanceAfter = transaction.balanceBefore + transaction.amount;
-      } else if (transaction.transactionType === 'debit') {
-        transaction.balanceAfter = transaction.balanceBefore - transaction.amount;
-        
-        // Ensure balance doesn't go negative
-        if (transaction.balanceAfter < 0) {
-          throw new Error('Insufficient points balance');
-        }
-      }
+  indexes: [
+    {
+      fields: ['user_id']
+    },
+    {
+      fields: ['activity_type']
+    },
+    {
+      fields: ['transaction_type']
+    },
+    {
+      fields: ['status']
+    },
+    {
+      fields: ['created_at']
+    },
+    {
+      fields: ['user_id', 'activity_type']
+    },
+    {
+      fields: ['user_id', 'created_at']
     }
-  }
+  ]
 });
 
 // Instance methods
 PointTransaction.prototype.toSafeJSON = function() {
   const values = Object.assign({}, this.get());
   
-  // Format for display
-  values.formattedAmount = this.transactionType === 'credit' 
-    ? `+${this.amount}` 
-    : `-${this.amount}`;
-    
+  // Include the virtual balanceAfter field
+  values.balanceAfter = this.balanceAfter;
+  
   return values;
 };
 
 // Static methods
-PointTransaction.getUserTransactionHistory = function(userId, options = {}) {
+PointTransaction.getUserTransactions = function(userId, options = {}) {
   const {
     page = 1,
     limit = 20,
-    activityType,
     transactionType,
+    activityType,
+    status = 'completed',
     startDate,
     endDate
   } = options;
 
-  const whereClause = { userId };
-  
-  if (activityType) {
-    whereClause.activityType = activityType;
-  }
+  const whereClause = { 
+    userId,
+    status: status || 'completed'
+  };
   
   if (transactionType) {
     whereClause.transactionType = transactionType;
   }
   
+  if (activityType) {
+    whereClause.activityType = activityType;
+  }
+  
   if (startDate || endDate) {
-    whereClause.createdAt = {};
-    if (startDate) whereClause.createdAt[sequelize.Sequelize.Op.gte] = startDate;
-    if (endDate) whereClause.createdAt[sequelize.Sequelize.Op.lte] = endDate;
+    whereClause.created_at = {};
+    if (startDate) {
+      whereClause.created_at[sequelize.Sequelize.Op.gte] = new Date(startDate);
+    }
+    if (endDate) {
+      whereClause.created_at[sequelize.Sequelize.Op.lte] = new Date(endDate);
+    }
   }
 
   return this.findAndCountAll({
     where: whereClause,
-    order: [['createdAt', 'DESC']],
+    order: [['created_at', 'DESC']],
     limit: parseInt(limit),
     offset: (parseInt(page) - 1) * parseInt(limit)
   });
 };
 
 PointTransaction.getUserPointsSummary = async function(userId) {
-  const [totalEarned, totalSpent, currentBalance] = await Promise.all([
-    // Total points earned (credit)
-    this.sum('amount', {
-      where: {
-        userId,
-        transactionType: 'credit',
-        status: 'completed'
-      }
-    }),
-    
-    // Total points spent (debit)
-    this.sum('amount', {
-      where: {
-        userId,
-        transactionType: 'debit',
-        status: 'completed'
-      }
-    }),
-    
-    // Current balance (latest balance_after)
-    this.findOne({
-      where: { userId, status: 'completed' },
-      order: [['createdAt', 'DESC']],
-      attributes: ['balanceAfter']
-    })
-  ]);
+  const creditResult = await this.findOne({
+    where: { 
+      userId, 
+      transactionType: 'credit',
+      status: 'completed'
+    },
+    attributes: [
+      [sequelize.fn('SUM', sequelize.col('amount')), 'totalCredits'],
+      [sequelize.fn('COUNT', sequelize.col('id')), 'creditCount']
+    ]
+  });
+
+  const debitResult = await this.findOne({
+    where: { 
+      userId, 
+      transactionType: 'debit',
+      status: 'completed'
+    },
+    attributes: [
+      [sequelize.fn('SUM', sequelize.col('amount')), 'totalDebits'],
+      [sequelize.fn('COUNT', sequelize.col('id')), 'debitCount']
+    ]
+  });
+
+  const totalCredits = parseInt(creditResult?.dataValues?.totalCredits) || 0;
+  const totalDebits = parseInt(debitResult?.dataValues?.totalDebits) || 0;
+  const creditCount = parseInt(creditResult?.dataValues?.creditCount) || 0;
+  const debitCount = parseInt(debitResult?.dataValues?.debitCount) || 0;
 
   return {
-    totalEarned: totalEarned || 0,
-    totalSpent: totalSpent || 0,
-    currentBalance: currentBalance ? currentBalance.balanceAfter : 0,
-    netPoints: (totalEarned || 0) - (totalSpent || 0)
+    totalEarned: totalCredits,
+    totalSpent: totalDebits,
+    netBalance: totalCredits - totalDebits,
+    totalTransactions: creditCount + debitCount,
+    creditTransactions: creditCount,
+    debitTransactions: debitCount
   };
 };
 
-PointTransaction.getSystemPointsStatistics = async function() {
-  const [totalPointsIssued, totalPointsRedeemed, activeUsers, topEarners] = await Promise.all([
-    // Total points issued
-    this.sum('amount', {
-      where: {
-        transactionType: 'credit',
-        status: 'completed'
-      }
+PointTransaction.getActivityStatistics = async function(activityType = null, options = {}) {
+  const {
+    startDate,
+    endDate,
+    status = 'completed'
+  } = options;
+
+  const whereClause = { status };
+  
+  if (activityType) {
+    whereClause.activityType = activityType;
+  }
+  
+  if (startDate || endDate) {
+    whereClause.created_at = {};
+    if (startDate) {
+      whereClause.created_at[sequelize.Sequelize.Op.gte] = new Date(startDate);
+    }
+    if (endDate) {
+      whereClause.created_at[sequelize.Sequelize.Op.lte] = new Date(endDate);
+    }
+  }
+
+  const stats = await this.findAll({
+    where: whereClause,
+    attributes: [
+      'activity_type',
+      'transaction_type',
+      [sequelize.fn('COUNT', sequelize.col('id')), 'transaction_count'],
+      [sequelize.fn('SUM', sequelize.col('amount')), 'total_amount'],
+      [sequelize.fn('COUNT', sequelize.fn('DISTINCT', sequelize.col('user_id'))), 'unique_users']
+    ],
+    group: ['activity_type', 'transaction_type'],
+    order: [['activity_type', 'ASC'], ['transaction_type', 'ASC']]
+  });
+
+  return stats;
+};
+
+PointTransaction.getSystemStatistics = async function(options = {}) {
+  const {
+    startDate,
+    endDate,
+    status = 'completed'
+  } = options;
+
+  const whereClause = { status };
+  
+  if (startDate || endDate) {
+    whereClause.created_at = {};
+    if (startDate) {
+      whereClause.created_at[sequelize.Sequelize.Op.gte] = new Date(startDate);
+    }
+    if (endDate) {
+      whereClause.created_at[sequelize.Sequelize.Op.lte] = new Date(endDate);
+    }
+  }
+
+  const [totalStats, activityStats] = await Promise.all([
+    this.findOne({
+      where: whereClause,
+      attributes: [
+        [sequelize.fn('COUNT', sequelize.col('id')), 'totalTransactions'],
+        [sequelize.fn('SUM', 
+          sequelize.literal("CASE WHEN transaction_type = 'credit' THEN amount ELSE 0 END")
+        ), 'totalPointsAwarded'],
+        [sequelize.fn('SUM', 
+          sequelize.literal("CASE WHEN transaction_type = 'debit' THEN amount ELSE 0 END")
+        ), 'totalPointsRedeemed'],
+        [sequelize.fn('COUNT', sequelize.fn('DISTINCT', sequelize.col('user_id'))), 'activeUsers']
+      ]
     }),
     
-    // Total points redeemed
-    this.sum('amount', {
-      where: {
-        transactionType: 'debit',
-        status: 'completed'
-      }
-    }),
-    
-    // Active users with points
-    this.count({
-      distinct: true,
-      col: 'userId',
-      where: {
-        status: 'completed'
-      }
-    }),
-    
-    // Top point earners
-    sequelize.query(`
-      SELECT 
-        u.id, u.username, u.email,
-        SUM(CASE WHEN pt.transaction_type = 'credit' THEN pt.amount ELSE 0 END) as total_earned,
-        u.current_points
-      FROM users u
-      LEFT JOIN point_transactions pt ON u.id = pt.user_id AND pt.status = 'completed'
-      GROUP BY u.id, u.username, u.email, u.current_points
-      HAVING total_earned > 0
-      ORDER BY total_earned DESC
-      LIMIT 10
-    `, {
-      type: sequelize.QueryTypes.SELECT
+    this.findAll({
+      where: whereClause,
+      attributes: [
+        'activity_type',
+        [sequelize.fn('COUNT', sequelize.col('id')), 'count'],
+        [sequelize.fn('SUM', sequelize.col('amount')), 'total'],
+        [sequelize.fn('COUNT', sequelize.fn('DISTINCT', sequelize.col('user_id'))), 'users']
+      ],
+      group: ['activity_type'],
+      order: [[sequelize.fn('SUM', sequelize.col('amount')), 'DESC']]
     })
   ]);
 
   return {
-    totalPointsIssued: totalPointsIssued || 0,
-    totalPointsRedeemed: totalPointsRedeemed || 0,
-    totalPointsInCirculation: (totalPointsIssued || 0) - (totalPointsRedeemed || 0),
-    activeUsers: activeUsers || 0,
-    topEarners
+    overview: {
+      totalTransactions: parseInt(totalStats?.dataValues?.totalTransactions) || 0,
+      totalPointsAwarded: parseInt(totalStats?.dataValues?.totalPointsAwarded) || 0,
+      totalPointsRedeemed: parseInt(totalStats?.dataValues?.totalPointsRedeemed) || 0,
+      activeUsers: parseInt(totalStats?.dataValues?.activeUsers) || 0,
+      netPointsInCirculation: (parseInt(totalStats?.dataValues?.totalPointsAwarded) || 0) - (parseInt(totalStats?.dataValues?.totalPointsRedeemed) || 0)
+    },
+    byActivity: activityStats.map(stat => ({
+      activityType: stat.activity_type,
+      transactionCount: parseInt(stat.dataValues.count),
+      totalPoints: parseInt(stat.dataValues.total),
+      uniqueUsers: parseInt(stat.dataValues.users)
+    }))
   };
 };
 

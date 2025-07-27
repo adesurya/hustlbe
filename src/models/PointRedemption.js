@@ -213,7 +213,7 @@ PointRedemption.getUserRedemptions = function(userId, options = {}) {
 
   return this.findAndCountAll({
     where: whereClause,
-    order: [['requestedAt', 'DESC']],
+    order: [['requested_at', 'DESC']], // Use actual database field name
     limit: parseInt(limit),
     offset: (parseInt(page) - 1) * parseInt(limit)
   });
@@ -242,16 +242,9 @@ PointRedemption.getAllRedemptions = function(options = {}) {
     whereClause.userId = userId;
   }
 
-  const User = require('./User');
-
   return this.findAndCountAll({
     where: whereClause,
-    include: [{
-      model: User,
-      as: 'user',
-      attributes: ['id', 'username', 'email']
-    }],
-    order: [['requestedAt', 'DESC']],
+    order: [['requested_at', 'DESC']], // Use actual database field name
     limit: parseInt(limit),
     offset: (parseInt(page) - 1) * parseInt(limit)
   });

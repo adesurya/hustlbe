@@ -5,7 +5,7 @@ const ExtractJwt = require('passport-jwt').ExtractJwt;
 const User = require('../models/User');
 const { logAuthAttempt, logSecurityEvent } = require('../utils/logger');
 
-// JWT Strategy
+// JWT Strategy with token version validation
 passport.use(new JwtStrategy({
   jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
   secretOrKey: process.env.JWT_SECRET,
@@ -30,23 +30,60 @@ passport.use(new JwtStrategy({
       return done(null, false);
     }
 
-    // Check if password was changed after token was issued
-    if (user.passwordChangedAt && payload.iat < parseInt(user.passwordChangedAt.getTime() / 1000, 10)) {
+    // Check token version - NEW: Add token version validation
+    const userTokenVersion = user.tokenVersion || 0;
+    const decodedTokenVersion = payload.tokenVersion || 0;
+    
+    if (decodedTokenVersion !== userTokenVersion) {
       logAuthAttempt('jwt_validation', false, { 
         userId: user.id, 
-        reason: 'Password changed after token issued' 
+        reason: 'Token version mismatch',
+        decodedVersion: decodedTokenVersion,
+        currentVersion: userTokenVersion
       });
       return done(null, false);
     }
 
+    // Check if password was changed after token was issued - FIXED: Handle date properly
+    if (user.passwordChangedAt && payload.iat) {
+      let passwordChangedTimestamp;
+      
+      // Handle both Date object and string
+      if (user.passwordChangedAt instanceof Date) {
+        passwordChangedTimestamp = parseInt(user.passwordChangedAt.getTime() / 1000, 10);
+      } else if (typeof user.passwordChangedAt === 'string') {
+        passwordChangedTimestamp = parseInt(new Date(user.passwordChangedAt).getTime() / 1000, 10);
+      } else {
+        passwordChangedTimestamp = parseInt(user.passwordChangedAt, 10);
+      }
+      
+      if (payload.iat < passwordChangedTimestamp) {
+        logAuthAttempt('jwt_validation', false, { 
+          userId: user.id, 
+          reason: 'Password changed after token issued',
+          tokenIat: payload.iat,
+          passwordChangedAt: passwordChangedTimestamp
+        });
+        return done(null, false);
+      }
+    }
+
+    logAuthAttempt('jwt_validation', true, { 
+      userId: user.id,
+      tokenVersion: userTokenVersion
+    });
+
     return done(null, user);
   } catch (error) {
-    logSecurityEvent('jwt_strategy_error', { error: error.message });
+    logSecurityEvent('jwt_strategy_error', { 
+      error: error.message,
+      stack: error.stack
+    });
     return done(error, false);
   }
 }));
 
-// Google OAuth Strategy
+// Google OAuth Strategy - UPDATED: Initialize tokenVersion for new users
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
@@ -66,7 +103,8 @@ passport.use(new GoogleStrategy({
       
       logAuthAttempt('google_oauth', true, { 
         userId: user.id, 
-        googleId: profile.id 
+        googleId: profile.id,
+        tokenVersion: user.tokenVersion
       });
       
       return done(null, user);
@@ -87,13 +125,14 @@ passport.use(new GoogleStrategy({
       
       logAuthAttempt('google_oauth_link', true, { 
         userId: user.id, 
-        googleId: profile.id 
+        googleId: profile.id,
+        tokenVersion: user.tokenVersion
       });
       
       return done(null, user);
     }
 
-    // Create new user
+    // Create new user - UPDATED: Include tokenVersion initialization
     const newUser = await User.create({
       username: profile.displayName.replace(/\s+/g, '').toLowerCase() + Date.now(),
       email: profile.emails[0].value,
@@ -102,19 +141,22 @@ passport.use(new GoogleStrategy({
       isVerified: true,
       emailVerifiedAt: new Date(),
       role: 'user',
-      lastLogin: new Date()
+      lastLogin: new Date(),
+      tokenVersion: 0 // Initialize token version for new OAuth users
     });
 
     logAuthAttempt('google_oauth_signup', true, { 
       userId: newUser.id, 
       googleId: profile.id,
-      email: profile.emails[0].value
+      email: profile.emails[0].value,
+      tokenVersion: newUser.tokenVersion
     });
 
     return done(null, newUser);
   } catch (error) {
     logSecurityEvent('google_oauth_error', { 
       error: error.message,
+      stack: error.stack,
       googleId: profile.id 
     });
     return done(error, null);
@@ -126,12 +168,34 @@ passport.serializeUser((user, done) => {
   done(null, user.id);
 });
 
-// Deserialize user from session
+// Deserialize user from session - UPDATED: Handle potential errors better
 passport.deserializeUser(async (id, done) => {
   try {
     const user = await User.findByPk(id);
+    
+    if (!user) {
+      logSecurityEvent('session_deserialize_failed', {
+        userId: id,
+        reason: 'User not found'
+      });
+      return done(null, false);
+    }
+
+    if (!user.isActive) {
+      logSecurityEvent('session_deserialize_failed', {
+        userId: id,
+        reason: 'User inactive'
+      });
+      return done(null, false);
+    }
+
     done(null, user);
   } catch (error) {
+    logSecurityEvent('session_deserialize_error', {
+      userId: id,
+      error: error.message,
+      stack: error.stack
+    });
     done(error, null);
   }
 });

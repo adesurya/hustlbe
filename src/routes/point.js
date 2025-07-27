@@ -7,7 +7,8 @@ const {
   validateRedemptionProcessing,
   validateTransactionFilter,
   validatePagination,
-  validateIdParam
+  validateRedemptionIdParam,
+  validateUserIdParam
 } = require('../middleware/validation');
 const { generalLimiter } = require('../config/security');
 
@@ -95,14 +96,14 @@ router.get('/admin/redemptions',
  */
 router.put('/admin/redemptions/:redemptionId/process',
   authorizeRoles('admin'),
-  validateIdParam,
+  validateRedemptionIdParam, // Use specific validator for redemptionId
   validateRedemptionProcessing,
   pointController.processRedemption
 );
 
 /**
  * @route   GET /api/v1/points/admin/statistics
- * @desc    Get system point statistics
+ * @desc    Get system point statistics including consistency check
  * @access  Admin
  */
 router.get('/admin/statistics',
@@ -119,6 +120,37 @@ router.post('/admin/award',
   authorizeRoles('admin'),
   validateManualPointAward,
   pointController.awardPointsManually
+);
+
+/**
+ * @route   GET /api/v1/points/admin/consistency/check
+ * @desc    Check system consistency between users and transactions
+ * @access  Admin
+ */
+router.get('/admin/consistency/check',
+  authorizeRoles('admin'),
+  pointController.checkSystemConsistency
+);
+
+/**
+ * @route   POST /api/v1/points/admin/consistency/fix
+ * @desc    Fix inconsistent point balances between users and transactions
+ * @access  Admin
+ */
+router.post('/admin/consistency/fix',
+  authorizeRoles('admin'),
+  pointController.fixInconsistentBalances
+);
+
+/**
+ * @route   GET /api/v1/points/admin/users/:userId/balance
+ * @desc    Get detailed balance information for specific user
+ * @access  Admin
+ */
+router.get('/admin/users/:userId/balance',
+  authorizeRoles('admin'),
+  validateUserIdParam, // Use specific validator for userId
+  pointController.getUserBalanceDetails
 );
 
 module.exports = router;

@@ -77,7 +77,7 @@ router.put('/:id',
 
 /**
  * @route   DELETE /api/v1/categories/:id
- * @desc    Delete category
+ * @desc    Soft delete category
  * @access  Admin
  */
 router.delete('/:id',
@@ -85,6 +85,30 @@ router.delete('/:id',
   authorizeRoles('admin'),
   validateIdParam,
   categoryController.deleteCategory
+);
+
+/**
+ * @route   DELETE /api/v1/categories/:id/force
+ * @desc    Force delete category (permanent)
+ * @access  Admin
+ */
+router.delete('/:id/force',
+  authenticateToken,
+  authorizeRoles('admin'),
+  validateIdParam,
+  categoryController.forceDeleteCategory
+);
+
+/**
+ * @route   POST /api/v1/categories/:id/restore
+ * @desc    Restore soft deleted category
+ * @access  Admin
+ */
+router.post('/:id/restore',
+  authenticateToken,
+  authorizeRoles('admin'),
+  validateIdParam,
+  categoryController.restoreCategory
 );
 
 /**

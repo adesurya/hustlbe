@@ -159,14 +159,15 @@ class CategoryService {
   async createCategory(categoryData, userId) {
     const { name, slug, description, isActive, sortOrder } = categoryData;
 
-    // Check if category with same name or slug exists
+    // Check if category with same name or slug exists (including soft deleted ones)
     const existingCategory = await Category.findOne({
       where: {
         [Category.sequelize.Sequelize.Op.or]: [
           { name },
           { slug: slug || name.toLowerCase().replace(/\s+/g, '-') }
         ]
-      }
+      },
+      paranoid: false // Include soft deleted records
     });
 
     if (existingCategory) {
@@ -219,7 +220,10 @@ class CategoryService {
         whereClause[Category.sequelize.Sequelize.Op.or] = orConditions;
       }
 
-      const existingCategory = await Category.findOne({ where: whereClause });
+      const existingCategory = await Category.findOne({ 
+        where: whereClause,
+        paranoid: false // Include soft deleted records
+      });
 
       if (existingCategory) {
         const field = existingCategory.name === updateData.name ? 'name' : 'slug';
@@ -243,7 +247,7 @@ class CategoryService {
   }
 
   /**
-   * Delete category
+   * Delete category (Soft delete)
    * @param {number} categoryId - Category ID
    * @param {number} userId - User ID who deletes the category
    * @returns {boolean} Success status
@@ -255,20 +259,19 @@ class CategoryService {
       throw new Error('Category not found');
     }
 
-    // Check if category has products
+    // Check if category has active products
     const productCount = await Product.count({
-      where: { categoryId }
+      where: { 
+        categoryId,
+        isActive: true 
+      }
     });
 
     if (productCount > 0) {
-      throw new Error('Cannot delete category that has products. Please move or delete products first.');
+      throw new Error('Cannot delete category that has active products. Please deactivate or move products first.');
     }
 
-    // Delete category image if exists
-    if (category.image) {
-      deleteFile(`uploads/categories/${category.image}`);
-    }
-
+    // Perform soft delete
     await category.destroy();
 
     logUserAction('category_deleted', userId, {
@@ -277,6 +280,76 @@ class CategoryService {
     });
 
     return true;
+  }
+
+  /**
+   * Force delete category (Hard delete)
+   * @param {number} categoryId - Category ID
+   * @param {number} userId - User ID who deletes the category
+   * @returns {boolean} Success status
+   */
+  async forceDeleteCategory(categoryId, userId) {
+    const category = await Category.findByPk(categoryId, {
+      paranoid: false // Include soft deleted records
+    });
+
+    if (!category) {
+      throw new Error('Category not found');
+    }
+
+    // Check if category has products
+    const productCount = await Product.count({
+      where: { categoryId },
+      paranoid: false // Include soft deleted products
+    });
+
+    if (productCount > 0) {
+      throw new Error('Cannot permanently delete category that has products. Please delete products first.');
+    }
+
+    // Delete category image if exists
+    if (category.image) {
+      deleteFile(`uploads/categories/${category.image}`);
+    }
+
+    // Force delete (permanent)
+    await category.destroy({ force: true });
+
+    logUserAction('category_force_deleted', userId, {
+      categoryId,
+      categoryName: category.name
+    });
+
+    return true;
+  }
+
+  /**
+   * Restore soft deleted category
+   * @param {number} categoryId - Category ID
+   * @param {number} userId - User ID who restores the category
+   * @returns {object} Restored category
+   */
+  async restoreCategory(categoryId, userId) {
+    const category = await Category.findByPk(categoryId, {
+      paranoid: false
+    });
+
+    if (!category) {
+      throw new Error('Category not found');
+    }
+
+    if (!category.deletedAt) {
+      throw new Error('Category is not deleted');
+    }
+
+    await category.restore();
+
+    logUserAction('category_restored', userId, {
+      categoryId,
+      categoryName: category.name
+    });
+
+    return category;
   }
 
   /**

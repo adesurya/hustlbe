@@ -188,7 +188,7 @@ class CategoryController {
   });
 
   /**
-   * Delete category (Admin only)
+   * Soft delete category (Admin only)
    */
   deleteCategory = asyncHandler(async (req, res) => {
     const { id } = req.params;
@@ -202,6 +202,49 @@ class CategoryController {
         null,
         null,
         SUCCESS_CODES.RESOURCE_DELETED
+      )
+    );
+  });
+
+  /**
+   * Force delete category (Admin only) - Permanent deletion
+   */
+  forceDeleteCategory = asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    await categoryService.forceDeleteCategory(parseInt(id), userId);
+
+    res.status(HTTP_STATUS.OK.code).json(
+      successResponse(
+        'Category permanently deleted successfully',
+        null,
+        null,
+        SUCCESS_CODES.RESOURCE_DELETED
+      )
+    );
+  });
+
+  /**
+   * Restore soft deleted category (Admin only)
+   */
+  restoreCategory = asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const category = await categoryService.restoreCategory(parseInt(id), userId);
+
+    const categoryWithImageUrl = {
+      ...category.toJSON(),
+      imageUrl: category.image ? getFileUrl(category.image, 'categories') : null
+    };
+
+    res.status(HTTP_STATUS.OK.code).json(
+      successResponse(
+        'Category restored successfully',
+        categoryWithImageUrl,
+        null,
+        SUCCESS_CODES.RESOURCE_UPDATED
       )
     );
   });

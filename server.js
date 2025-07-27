@@ -94,16 +94,6 @@ const startServer = async () => {
         logger.info('   Authentication:');
         logger.info(`     POST ${process.env.API_PREFIX || '/api/v1'}/auth/register`);
         logger.info(`     POST ${process.env.API_PREFIX || '/api/v1'}/auth/login`);
-        logger.info(`     GET  ${process.env.API_PREFIX || '/api/v1'}/auth/google`);
-        logger.info(`     POST ${process.env.API_PREFIX || '/api/v1'}/auth/logout`);
-        logger.info(`     GET  ${process.env.API_PREFIX || '/api/v1'}/auth/profile`);
-        logger.info('   Categories:');
-        logger.info(`     GET  ${process.env.API_PREFIX || '/api/v1'}/categories`);
-        logger.info(`     POST ${process.env.API_PREFIX || '/api/v1'}/categories (Admin)`);
-        logger.info(`     PUT  ${process.env.API_PREFIX || '/api/v1'}/categories/:id (Admin)`);
-        logger.info('   Products:');
-        logger.info(`     GET  ${process.env.API_PREFIX || '/api/v1'}/products`);
-        logger.info(`     GET  ${process.env.API_PREFIX || '/api/v1'}/products/featured`);
         logger.info(`     GET  ${process.env.API_PREFIX || '/api/v1'}/products/search`);
         logger.info(`     POST ${process.env.API_PREFIX || '/api/v1'}/products (Admin)`);
         logger.info('   Points:');
@@ -112,6 +102,21 @@ const startServer = async () => {
         logger.info('   File Access:');
         logger.info(`     GET  /uploads/categories/:filename`);
         logger.info(`     GET  /uploads/products/:filename`);
+        logger.info('');
+        logger.info('🔧 Admin Features:');
+        logger.info('   • Complete user CRUD operations');
+        logger.info('   • User ban/unban management with email notifications');
+        logger.info('   • User statistics and analytics (including banned users)');
+        logger.info('   • Account management (lock/unlock, activate/deactivate)');
+        logger.info('   • Password reset for users');
+        logger.info('   • User restoration from soft delete');
+        logger.info('   • Enhanced security logging and audit trail');
+        logger.info('');
+        logger.info('👤 User Features:');
+        logger.info('   • Enhanced profile management');
+        logger.info('   • Public profile viewing');
+        logger.info('   • Account metrics and status');
+        logger.info('   • Email change with re-verification');
       }
     });
 

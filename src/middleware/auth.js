@@ -3,7 +3,7 @@ const User = require('../models/User');
 const { createResponse } = require('../utils/response');
 const winston = require('winston');
 
-// Verify JWT token
+// Verify JWT token with token version validation
 const authenticateToken = async (req, res, next) => {
   try {
     const authHeader = req.headers['authorization'];
@@ -17,33 +17,100 @@ const authenticateToken = async (req, res, next) => {
 
     // Verify token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    console.log('🔍 Token decoded:', { 
+      userId: decoded.userId, 
+      tokenVersion: decoded.tokenVersion, 
+      iat: decoded.iat, 
+      exp: decoded.exp 
+    });
     
     // Check if user still exists
     const user = await User.findByPk(decoded.userId);
     if (!user) {
+      console.log('❌ User not found:', decoded.userId);
       return res.status(401).json(
         createResponse(false, 'User no longer exists', null, 'USER_NOT_FOUND')
       );
     }
 
+    console.log('👤 Current user:', { 
+      id: user.id, 
+      tokenVersion: user.tokenVersion, 
+      isActive: user.isActive 
+    });
+
     // Check if user is active
     if (!user.isActive) {
+      console.log('❌ Account deactivated for user:', user.id);
       return res.status(401).json(
         createResponse(false, 'Account has been deactivated', null, 'ACCOUNT_DEACTIVATED')
       );
     }
 
-    // Check if password was changed after token was issued
-    if (user.passwordChangedAt && decoded.iat < parseInt(user.passwordChangedAt.getTime() / 1000, 10)) {
+    // MAIN CHECK: Validate token version
+    const userTokenVersion = user.tokenVersion || 0;
+    const decodedTokenVersion = decoded.tokenVersion || 0;
+    
+    // If user has null tokenVersion, fix it
+    if (user.tokenVersion === null || user.tokenVersion === undefined) {
+      console.log('🔧 Fixing null tokenVersion for user:', user.id);
+      try {
+        await user.update({ tokenVersion: 0 });
+        await user.reload();
+      } catch (updateError) {
+        console.error('❌ Failed to update tokenVersion:', updateError);
+      }
+    }
+    
+    if (decodedTokenVersion !== userTokenVersion) {
+      console.log('❌ Token version mismatch:', {
+        decodedVersion: decodedTokenVersion,
+        currentVersion: userTokenVersion,
+        userId: user.id,
+        originalDecodedVersion: decoded.tokenVersion,
+        originalUserVersion: user.tokenVersion
+      });
+      
+      winston.warn(`Token version mismatch for user ${user.id}. Token: ${decodedTokenVersion}, Current: ${userTokenVersion}`);
+      
       return res.status(401).json(
-        createResponse(false, 'Password recently changed. Please log in again.', null, 'PASSWORD_CHANGED')
+        createResponse(false, 'Token has been invalidated. Please log in again.', null, 'TOKEN_INVALIDATED')
       );
     }
+
+    // Additional check: Password change validation (backup security)
+    if (user.passwordChangedAt) {
+      let passwordChangedTimestamp;
+      
+      // Handle both Date object and string
+      if (user.passwordChangedAt instanceof Date) {
+        passwordChangedTimestamp = parseInt(user.passwordChangedAt.getTime() / 1000, 10);
+      } else if (typeof user.passwordChangedAt === 'string') {
+        passwordChangedTimestamp = parseInt(new Date(user.passwordChangedAt).getTime() / 1000, 10);
+      } else {
+        // If it's already a timestamp
+        passwordChangedTimestamp = parseInt(user.passwordChangedAt, 10);
+      }
+      
+      if (decoded.iat < passwordChangedTimestamp) {
+        console.log('❌ Password changed after token issued:', {
+          tokenIat: decoded.iat,
+          passwordChangedAt: passwordChangedTimestamp,
+          passwordChangedAtRaw: user.passwordChangedAt
+        });
+        return res.status(401).json(
+          createResponse(false, 'Password recently changed. Please log in again.', null, 'PASSWORD_CHANGED')
+        );
+      }
+    }
+
+    console.log('✅ Token validation successful for user:', user.id);
 
     // Add user to request object
     req.user = user;
     next();
   } catch (error) {
+    console.log('❌ Token verification error:', error.message);
     winston.error('Token verification error:', error);
     
     if (error.name === 'JsonWebTokenError') {
@@ -98,7 +165,8 @@ const optionalAuth = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findByPk(decoded.userId);
     
-    if (user && user.isActive) {
+    // Check token version for optional auth too
+    if (user && user.isActive && decoded.tokenVersion === (user.tokenVersion || 0)) {
       req.user = user;
     } else {
       req.user = null;
@@ -138,30 +206,47 @@ const checkOwnershipOrAdmin = (resourceUserIdField = 'userId') => {
   };
 };
 
-// Verify refresh token
+// Verify refresh token with token version
 const verifyRefreshToken = async (req, res, next) => {
   try {
     const { refreshToken } = req.body;
+    const cookieRefreshToken = req.cookies?.refreshToken;
+    const tokenToUse = refreshToken || cookieRefreshToken;
 
-    if (!refreshToken) {
+    if (!tokenToUse) {
       return res.status(401).json(
         createResponse(false, 'Refresh token required', null, 'MISSING_REFRESH_TOKEN')
       );
     }
 
     // Verify refresh token format
-    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    const decoded = jwt.verify(tokenToUse, process.env.JWT_REFRESH_SECRET);
     
     // Find user and validate refresh token
     const user = await User.findByPk(decoded.userId);
-    if (!user || !user.validateRefreshToken(refreshToken)) {
+    if (!user) {
+      return res.status(401).json(
+        createResponse(false, 'Invalid refresh token', null, 'INVALID_REFRESH_TOKEN')
+      );
+    }
+
+    // Check token version
+    if (decoded.tokenVersion !== (user.tokenVersion || 0)) {
+      winston.warn(`Refresh token version mismatch for user ${user.id}. Token: ${decoded.tokenVersion}, Current: ${user.tokenVersion}`);
+      return res.status(401).json(
+        createResponse(false, 'Refresh token has been invalidated', null, 'REFRESH_TOKEN_INVALIDATED')
+      );
+    }
+
+    // Validate refresh token hash
+    if (!user.validateRefreshToken(tokenToUse)) {
       return res.status(401).json(
         createResponse(false, 'Invalid refresh token', null, 'INVALID_REFRESH_TOKEN')
       );
     }
 
     req.user = user;
-    req.refreshToken = refreshToken;
+    req.refreshToken = tokenToUse;
     next();
   } catch (error) {
     winston.error('Refresh token verification error:', error);

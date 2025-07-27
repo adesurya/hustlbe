@@ -11,21 +11,12 @@ const PointActivity = sequelize.define('PointActivity', {
     type: DataTypes.STRING(50),
     allowNull: false,
     unique: true,
-    field: 'activity_code',
-    validate: {
-      len: [2, 50],
-      isUppercase: true,
-      is: /^[A-Z_]+$/
-    }
+    field: 'activity_code'
   },
   activityName: {
     type: DataTypes.STRING(100),
     allowNull: false,
-    field: 'activity_name',
-    validate: {
-      len: [2, 100],
-      notEmpty: true
-    }
+    field: 'activity_name'
   },
   description: {
     type: DataTypes.TEXT,
@@ -46,7 +37,7 @@ const PointActivity = sequelize.define('PointActivity', {
     allowNull: true,
     field: 'daily_limit',
     validate: {
-      min: 1,
+      min: 0,
       isInt: true
     }
   },
@@ -55,7 +46,7 @@ const PointActivity = sequelize.define('PointActivity', {
     allowNull: true,
     field: 'total_limit',
     validate: {
-      min: 1,
+      min: 0,
       isInt: true
     }
   },
@@ -87,58 +78,69 @@ const PointActivity = sequelize.define('PointActivity', {
   tableName: 'point_activities',
   timestamps: true,
   createdAt: 'created_at',
-  updatedAt: 'updated_at'
+  updatedAt: 'updated_at',
+  paranoid: true,
+  deletedAt: 'deleted_at'
 });
 
 // Instance methods
 PointActivity.prototype.isValidNow = function() {
   const now = new Date();
   
-  if (!this.isActive) return false;
-  if (this.validFrom && this.validFrom > now) return false;
-  if (this.validUntil && this.validUntil < now) return false;
+  if (!this.isActive) {
+    return false;
+  }
+  
+  if (this.validFrom && now < this.validFrom) {
+    return false;
+  }
+  
+  if (this.validUntil && now > this.validUntil) {
+    return false;
+  }
   
   return true;
 };
 
 PointActivity.prototype.canUserEarn = async function(userId) {
-  if (!this.isValidNow()) {
-    return { canEarn: false, reason: 'Activity is not active or not within valid period' };
-  }
-
   const PointTransaction = require('./PointTransaction');
   
+  if (!this.isValidNow()) {
+    return {
+      canEarn: false,
+      reason: 'Activity is not currently active'
+    };
+  }
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+
   // Check daily limit
   if (this.dailyLimit) {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-
-    const todayCount = await PointTransaction.count({
+    const todayTransactions = await PointTransaction.count({
       where: {
         userId,
         activityType: this.activityCode,
         status: 'completed',
-        createdAt: {
+        created_at: {
           [sequelize.Sequelize.Op.gte]: today,
           [sequelize.Sequelize.Op.lt]: tomorrow
         }
       }
     });
 
-    if (todayCount >= this.dailyLimit) {
-      return { 
-        canEarn: false, 
-        reason: `Daily limit of ${this.dailyLimit} reached for this activity`,
-        remainingToday: 0
+    if (todayTransactions >= this.dailyLimit) {
+      return {
+        canEarn: false,
+        reason: `Daily limit of ${this.dailyLimit} reached for this activity`
       };
     }
   }
 
   // Check total limit
   if (this.totalLimit) {
-    const totalCount = await PointTransaction.count({
+    const totalTransactions = await PointTransaction.count({
       where: {
         userId,
         activityType: this.activityCode,
@@ -146,23 +148,27 @@ PointActivity.prototype.canUserEarn = async function(userId) {
       }
     });
 
-    if (totalCount >= this.totalLimit) {
-      return { 
-        canEarn: false, 
-        reason: `Total limit of ${this.totalLimit} reached for this activity`,
-        remainingTotal: 0
+    if (totalTransactions >= this.totalLimit) {
+      return {
+        canEarn: false,
+        reason: `Total limit of ${this.totalLimit} reached for this activity`
       };
     }
   }
 
-  return { 
+  return {
     canEarn: true,
-    remainingToday: this.dailyLimit ? this.dailyLimit - (todayCount || 0) : null,
-    remainingTotal: this.totalLimit ? this.totalLimit - (totalCount || 0) : null
+    reason: null
   };
 };
 
 // Static methods
+PointActivity.findByCode = function(activityCode) {
+  return this.findOne({
+    where: { activityCode }
+  });
+};
+
 PointActivity.findActiveActivities = function() {
   const now = new Date();
   
@@ -178,14 +184,34 @@ PointActivity.findActiveActivities = function() {
         { validUntil: { [sequelize.Sequelize.Op.gte]: now } }
       ]
     },
-    order: [['activityName', 'ASC']]
+    order: [['activity_name', 'ASC']]
   });
 };
 
-PointActivity.findByCode = function(activityCode) {
-  return this.findOne({
-    where: { activityCode: activityCode.toUpperCase() }
+PointActivity.getActivityStatistics = async function() {
+  const PointTransaction = require('./PointTransaction');
+  
+  const stats = await sequelize.query(`
+    SELECT 
+      pa.id,
+      pa.activity_code,
+      pa.activity_name,
+      pa.points_reward,
+      pa.daily_limit,
+      pa.total_limit,
+      pa.is_active,
+      COUNT(pt.id) as usage_count,
+      SUM(CASE WHEN pt.status = 'completed' THEN pt.amount ELSE 0 END) as total_points_awarded,
+      COUNT(DISTINCT pt.user_id) as unique_users
+    FROM point_activities pa
+    LEFT JOIN point_transactions pt ON pa.activity_code = pt.activity_type
+    GROUP BY pa.id, pa.activity_code, pa.activity_name, pa.points_reward, pa.daily_limit, pa.total_limit, pa.is_active
+    ORDER BY total_points_awarded DESC
+  `, {
+    type: sequelize.QueryTypes.SELECT
   });
+
+  return stats;
 };
 
 module.exports = PointActivity;

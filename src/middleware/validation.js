@@ -1,6 +1,16 @@
 const { body, param, query, validationResult } = require('express-validator');
 const { validatePassword, sanitizeInput } = require('../config/security');
+const { isValidEmail } = require('../utils/email');
 const { createResponse } = require('../utils/response');
+const { errorResponse, HTTP_STATUS, ERROR_CODES } = require('../utils/response');
+
+// Custom sanitizer untuk email yang hanya lowercase tanpa menghapus dots
+const emailSanitizer = (value) => {
+  if (!value || typeof value !== 'string') {
+    return value;
+  }
+  return value.trim().toLowerCase();
+};
 
 // Handle validation errors
 const handleValidationErrors = (req, res, next) => {
@@ -12,12 +22,159 @@ const handleValidationErrors = (req, res, next) => {
       value: error.value
     }));
 
-    return res.status(400).json(
-      createResponse(false, 'Validation failed', { errors: errorMessages }, 'VALIDATION_ERROR')
+    return res.status(HTTP_STATUS.BAD_REQUEST.code).json(
+      errorResponse(
+        'Validation failed',
+        ERROR_CODES.VALIDATION_ERROR,
+        { errors: errorMessages }
+      )
     );
   }
   next();
 };
+
+// Validate user creation (Admin only)
+const validateCreateUser = [
+  body('username')
+    .isLength({ min: 3, max: 50 })
+    .withMessage('Username must be between 3 and 50 characters')
+    .matches(/^[a-zA-Z0-9_]+$/)
+    .withMessage('Username can only contain letters, numbers, and underscores')
+    .toLowerCase(),
+
+  body('email')
+    .isEmail()
+    .withMessage('Please provide a valid email address')
+    .isLength({ max: 100 })
+    .withMessage('Email must be less than 100 characters')
+    .normalizeEmail(),
+
+  body('phoneNumber')
+    .optional({ nullable: true })
+    .matches(/^[\+]?[1-9][\d]{0,15}$/)
+    .withMessage('Please provide a valid phone number'),
+
+  body('password')
+    .isLength({ min: 8, max: 128 })
+    .withMessage('Password must be between 8 and 128 characters')
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
+    .withMessage('Password must contain at least one uppercase letter, one lowercase letter, and one number'),
+
+  body('role')
+    .optional()
+    .isIn(['admin', 'user'])
+    .withMessage('Role must be either admin or user'),
+
+  body('isVerified')
+    .optional()
+    .isBoolean()
+    .withMessage('isVerified must be a boolean'),
+
+  body('isActive')
+    .optional()
+    .isBoolean()
+    .withMessage('isActive must be a boolean'),
+
+  body('currentPoints')
+    .optional()
+    .isInt({ min: 0 })
+    .withMessage('Current points must be a non-negative integer'),
+
+  handleValidationErrors
+];
+
+// Validate user update (Admin only)
+const validateUpdateUser = [
+  param('id')
+    .isInt({ min: 1 })
+    .withMessage('User ID must be a positive integer'),
+
+  body('username')
+    .optional()
+    .isLength({ min: 3, max: 50 })
+    .withMessage('Username must be between 3 and 50 characters')
+    .matches(/^[a-zA-Z0-9_]+$/)
+    .withMessage('Username can only contain letters, numbers, and underscores')
+    .toLowerCase(),
+
+  body('email')
+    .optional()
+    .isEmail()
+    .withMessage('Please provide a valid email address')
+    .isLength({ max: 100 })
+    .withMessage('Email must be less than 100 characters')
+    .normalizeEmail(),
+
+  body('phoneNumber')
+    .optional({ nullable: true })
+    .matches(/^[\+]?[1-9][\d]{0,15}$/)
+    .withMessage('Please provide a valid phone number'),
+
+  body('role')
+    .optional()
+    .isIn(['admin', 'user'])
+    .withMessage('Role must be either admin or user'),
+
+  body('profilePicture')
+    .optional({ nullable: true })
+    .isURL()
+    .withMessage('Profile picture must be a valid URL'),
+
+  body('isVerified')
+    .optional()
+    .isBoolean()
+    .withMessage('isVerified must be a boolean'),
+
+  body('isActive')
+    .optional()
+    .isBoolean()
+    .withMessage('isActive must be a boolean'),
+
+  body('currentPoints')
+    .optional()
+    .isInt({ min: 0 })
+    .withMessage('Current points must be a non-negative integer'),
+
+  body('twoFactorEnabled')
+    .optional()
+    .isBoolean()
+    .withMessage('twoFactorEnabled must be a boolean'),
+
+  handleValidationErrors
+];
+
+// Validate password reset (Admin only)
+const validateResetPassword = [
+  param('id')
+    .isInt({ min: 1 })
+    .withMessage('User ID must be a positive integer'),
+
+  body('newPassword')
+    .isLength({ min: 8, max: 128 })
+    .withMessage('New password must be between 8 and 128 characters')
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
+    .withMessage('New password must contain at least one uppercase letter, one lowercase letter, and one number'),
+
+  handleValidationErrors
+];
+
+// Validate user ID parameter
+const validateUserId = [
+  param('id')
+    .isInt({ min: 1 })
+    .withMessage('User ID must be a positive integer'),
+
+  handleValidationErrors
+];
+
+// Validate user ID parameter for profile access
+const validateProfileAccess = [
+  param('id')
+    .isInt({ min: 1 })
+    .withMessage('User ID must be a positive integer'),
+
+  handleValidationErrors
+];
 
 // Sanitize input middleware
 const sanitizeInputs = (fields) => {
@@ -56,6 +213,13 @@ const customValidators = {
       throw new Error('Invalid role. Must be either admin or user');
     }
     return true;
+  },
+
+  isValidEmailAddress: (value) => {
+    if (!isValidEmail(value)) {
+      throw new Error('Please provide a valid email address');
+    }
+    return true;
   }
 };
 
@@ -71,10 +235,11 @@ const validateSignup = [
     .withMessage('Username is required'),
     
   body('email')
-    .trim()
     .isEmail()
     .withMessage('Please provide a valid email address')
-    .normalizeEmail()
+    .trim()
+    .custom(customValidators.isValidEmailAddress)
+    .customSanitizer(emailSanitizer)
     .isLength({ max: 100 })
     .withMessage('Email must not exceed 100 characters'),
     
@@ -149,14 +314,16 @@ const validateProfileUpdate = [
     .isLength({ min: 3, max: 50 })
     .withMessage('Username must be between 3 and 50 characters')
     .isAlphanumeric()
-    .withMessage('Username must contain only letters and numbers'),
-    
+    .withMessage('Username can only contain letters, numbers, and underscores')
+    .toLowerCase(),
+
   body('email')
     .optional()
     .trim()
     .isEmail()
     .withMessage('Please provide a valid email address')
-    .normalizeEmail()
+    .custom(customValidators.isValidEmailAddress)
+    .customSanitizer(emailSanitizer)
     .isLength({ max: 100 })
     .withMessage('Email must not exceed 100 characters'),
     
@@ -229,11 +396,38 @@ const validatePagination = [
   handleValidationErrors
 ];
 
-// Validation rules for ID parameters
+// Validation rules for ID parameters (original)
 const validateIdParam = [
   param('id')
     .isInt({ min: 1 })
     .withMessage('ID must be a positive integer'),
+    
+  handleValidationErrors
+];
+
+// NEW: Validation rules for redemption ID parameter
+const validateRedemptionIdParam = [
+  param('redemptionId')
+    .isInt({ min: 1 })
+    .withMessage('Redemption ID must be a positive integer'),
+    
+  handleValidationErrors
+];
+
+// NEW: Validation rules for user ID parameter  
+const validateUserIdParam = [
+  param('userId')
+    .isInt({ min: 1 })
+    .withMessage('User ID must be a positive integer'),
+    
+  handleValidationErrors
+];
+
+// NEW: Flexible ID parameter validator (can specify parameter name)
+const validateDynamicIdParam = (paramName = 'id') => [
+  param(paramName)
+    .isInt({ min: 1 })
+    .withMessage(`${paramName} must be a positive integer`),
     
   handleValidationErrors
 ];
@@ -630,15 +824,24 @@ const validateTransactionFilter = [
   handleValidationErrors
 ];
 
+
 module.exports = {
+  validateCreateUser,
+  validateUpdateUser,
+  validateResetPassword,
+  validateUserId: validateProfileAccess, // Renamed for clarity
+  validateProfileAccess,
+  validateProfileUpdate,
   validateSignup,
   validateLogin,
   validatePasswordChange,
-  validateProfileUpdate,
   validateAdminUserUpdate,
   validateRefreshToken,
   validatePagination,
   validateIdParam,
+  validateRedemptionIdParam,   // NEW
+  validateUserIdParam,         // NEW  
+  validateDynamicIdParam,      // NEW
   validateCategoryCreate,
   validateCategoryUpdate,
   validateProductCreate,

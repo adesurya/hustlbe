@@ -18,17 +18,20 @@ const dbConfig = {
     idle: 10000
   },
   dialectOptions: {
-    charset: 'utf8mb4',
-    collate: 'utf8mb4_unicode_ci',
-    // SSL configuration for production
-    ssl: process.env.NODE_ENV === 'production' ? {
-      require: true,
-      rejectUnauthorized: false
-    } : false,
-    // Connection timeout
-    connectTimeout: 30000,
-    acquireTimeout: 30000,
-    timeout: 30000,
+    // Only valid MySQL2 options
+    supportBigNumbers: true,
+    bigNumberStrings: true,
+    dateStrings: true,
+    typeCast: true,
+    
+    // SSL configuration for production (fixed format)
+    ...(process.env.NODE_ENV === 'production' && {
+      ssl: {
+        require: true,
+        rejectUnauthorized: false
+      }
+    }),
+    
     // Prevent SQL injection
     multipleStatements: false
   },
@@ -37,13 +40,9 @@ const dbConfig = {
     underscored: true,
     paranoid: true, // Soft deletes
     freezeTableName: true,
+    // Move charset/collate to define section
     charset: 'utf8mb4',
     collate: 'utf8mb4_unicode_ci'
-  },
-  // Query options for security
-  query: {
-    raw: false,
-    nest: true
   },
   // Timezone
   timezone: '+07:00'
@@ -69,6 +68,46 @@ const testConnection = async () => {
   }
 };
 
+// Sync database and create tables
+const syncDatabase = async (force = false) => {
+  try {
+    // Sync all models (create tables if they don't exist)
+    await sequelize.sync({ 
+      force, // Set to true to drop and recreate tables
+      alter: !force // Alter existing tables to match models if force is false
+    });
+    
+    winston.info('Database synchronized successfully');
+    return true;
+  } catch (error) {
+    winston.error('Error synchronizing database:', error.message);
+    return false;
+  }
+};
+
+// Initialize database (create tables if they don't exist)
+const initializeDatabase = async () => {
+  try {
+    // Test connection first
+    const connected = await testConnection();
+    if (!connected) {
+      throw new Error('Cannot connect to database');
+    }
+
+    // Check if we need to create tables
+    const shouldSync = process.env.DB_SYNC === 'true' || process.env.NODE_ENV === 'development';
+    
+    if (shouldSync) {
+      await syncDatabase(process.env.DB_FORCE_SYNC === 'true');
+    }
+    
+    return true;
+  } catch (error) {
+    winston.error('Database initialization failed:', error.message);
+    return false;
+  }
+};
+
 // Graceful shutdown
 const gracefulShutdown = async () => {
   try {
@@ -86,5 +125,7 @@ process.on('SIGTERM', gracefulShutdown);
 module.exports = {
   sequelize,
   testConnection,
+  syncDatabase,
+  initializeDatabase,
   gracefulShutdown
 };

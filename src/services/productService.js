@@ -22,7 +22,7 @@ class ProductService {
       maxPoints,
       isActive,
       isFeatured,
-      sortBy = 'createdAt',
+      sortBy = 'created_at',
       sortOrder = 'DESC'
     } = options;
 
@@ -66,6 +66,24 @@ class ProductService {
       whereClause.isFeatured = isFeatured;
     }
 
+    // Map sortBy to actual database column names
+    const sortByMapping = {
+      'createdAt': 'created_at',
+      'updatedAt': 'updated_at',
+      'viewCount': 'view_count',
+      'stockQuantity': 'stock_quantity',
+      'sortOrder': 'sort_order',
+      'categoryId': 'category_id',
+      'isActive': 'is_active',
+      'isFeatured': 'is_featured',
+      'metaTitle': 'meta_title',
+      'metaDescription': 'meta_description',
+      'createdBy': 'created_by',
+      'updatedBy': 'updated_by'
+    };
+
+    const actualSortBy = sortByMapping[sortBy] || sortBy;
+
     const { count, rows } = await Product.findAndCountAll({
       where: whereClause,
       include: [{
@@ -73,7 +91,7 @@ class ProductService {
         as: 'category',
         attributes: ['id', 'name', 'slug']
       }],
-      order: [[sortBy, sortOrder.toUpperCase()]],
+      order: [[actualSortBy, sortOrder.toUpperCase()]],
       limit: parseInt(limit),
       offset: parseInt(offset)
     });
@@ -192,12 +210,13 @@ class ProductService {
   }
 
   /**
-   * Create new product
+   * Create new product with optional image
    * @param {object} productData - Product data
    * @param {number} userId - User ID who creates the product
+   * @param {string} imageFilename - Optional image filename
    * @returns {object} Created product
    */
-  async createProduct(productData, userId) {
+  async createProduct(productData, userId, imageFilename = null) {
     const {
       title,
       slug,
@@ -220,9 +239,17 @@ class ProductService {
       throw new Error('Category not found');
     }
 
+    // Generate slug if not provided
+    const finalSlug = slug || title
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .trim('-');
+
     // Check if product with same slug exists
     const existingProduct = await Product.findOne({
-      where: { slug: slug || title.toLowerCase().replace(/\s+/g, '-') }
+      where: { slug: finalSlug }
     });
 
     if (existingProduct) {
@@ -231,11 +258,12 @@ class ProductService {
 
     const product = await Product.create({
       title,
-      slug,
+      slug: finalSlug,
       description,
       points: parseInt(points),
       price: parseFloat(price),
       url,
+      image: imageFilename, // Save image filename if provided
       categoryId: parseInt(categoryId),
       isActive: isActive !== undefined ? isActive : true,
       isFeatured: isFeatured || false,
@@ -249,69 +277,84 @@ class ProductService {
     logUserAction('product_created', userId, {
       productId: product.id,
       productTitle: product.title,
-      categoryId: product.categoryId
+      categoryId: product.categoryId,
+      hasImage: !!imageFilename
     });
 
     return product;
   }
 
   /**
-   * Update product
-   * @param {number} productId - Product ID
-   * @param {object} updateData - Update data
-   * @param {number} userId - User ID who updates the product
-   * @returns {object} Updated product
-   */
-  async updateProduct(productId, updateData, userId) {
-    const product = await Product.findByPk(productId);
+ * Update product
+ * @param {number} productId - Product ID
+ * @param {object} updateData - Update data
+ * @param {number} userId - User ID who updates the product
+ * @param {string} imageFilename - Optional new image filename
+ * @returns {object} Updated product
+ */
+async updateProduct(productId, updateData, userId, imageFilename = null) {
+  const product = await Product.findByPk(productId);
 
-    if (!product) {
-      throw new Error('Product not found');
-    }
-
-    // Verify category exists if categoryId is being updated
-    if (updateData.categoryId) {
-      const category = await Category.findByPk(updateData.categoryId);
-      if (!category) {
-        throw new Error('Category not found');
-      }
-    }
-
-    // Check for duplicate slug if it's being updated
-    if (updateData.slug && updateData.slug !== product.slug) {
-      const existingProduct = await Product.findOne({
-        where: {
-          slug: updateData.slug,
-          id: { [Product.sequelize.Sequelize.Op.ne]: productId }
-        }
-      });
-
-      if (existingProduct) {
-        throw new Error('Product with this slug already exists');
-      }
-    }
-
-    // Convert numeric fields
-    if (updateData.points) updateData.points = parseInt(updateData.points);
-    if (updateData.price) updateData.price = parseFloat(updateData.price);
-    if (updateData.categoryId) updateData.categoryId = parseInt(updateData.categoryId);
-    if (updateData.stockQuantity !== undefined) updateData.stockQuantity = parseInt(updateData.stockQuantity);
-    if (updateData.sortOrder !== undefined) updateData.sortOrder = parseInt(updateData.sortOrder);
-
-    // Update product
-    await product.update({
-      ...updateData,
-      updatedBy: userId
-    });
-
-    logUserAction('product_updated', userId, {
-      productId: product.id,
-      productTitle: product.title,
-      changes: Object.keys(updateData)
-    });
-
-    return product;
+  if (!product) {
+    throw new Error('Product not found');
   }
+
+  // Verify category exists if categoryId is being updated
+  if (updateData.categoryId) {
+    const category = await Category.findByPk(updateData.categoryId);
+    if (!category) {
+      throw new Error('Category not found');
+    }
+  }
+
+  // Check for duplicate slug if it's being updated
+  if (updateData.slug && updateData.slug !== product.slug) {
+    const existingProduct = await Product.findOne({
+      where: {
+        slug: updateData.slug,
+        id: { [Product.sequelize.Sequelize.Op.ne]: productId }
+      }
+    });
+
+    if (existingProduct) {
+      throw new Error('Product with this slug already exists');
+    }
+  }
+
+  // Convert numeric fields
+  if (updateData.points) updateData.points = parseInt(updateData.points);
+  if (updateData.price) updateData.price = parseFloat(updateData.price);
+  if (updateData.categoryId) updateData.categoryId = parseInt(updateData.categoryId);
+  if (updateData.stockQuantity !== undefined) updateData.stockQuantity = parseInt(updateData.stockQuantity);
+  if (updateData.sortOrder !== undefined) updateData.sortOrder = parseInt(updateData.sortOrder);
+
+  // Handle image update
+  if (imageFilename) {
+    // Delete old image if exists
+    if (product.image) {
+      deleteFile(`uploads/products/${product.image}`);
+    }
+    updateData.image = imageFilename;
+  }
+
+  // Update product
+  await product.update({
+    ...updateData,
+    updatedBy: userId
+  });
+
+  // Reload product to get updated data
+  await product.reload();
+
+  logUserAction('product_updated', userId, {
+    productId: product.id,
+    productTitle: product.title,
+    changes: Object.keys(updateData),
+    hasNewImage: !!imageFilename
+  });
+
+  return product;
+}
 
   /**
    * Delete product
@@ -566,7 +609,7 @@ class ProductService {
     // Top viewed products
     const topViewedProducts = await Product.findAll({
       where: { isActive: true },
-      order: [['viewCount', 'DESC']],
+      order: [['view_count', 'DESC']],
       limit: 5,
       attributes: ['id', 'title', 'viewCount'],
       include: [{
